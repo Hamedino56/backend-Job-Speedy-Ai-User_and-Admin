@@ -36,7 +36,10 @@ Complete backend API server for JobSpeedy AI platform with user and admin authen
    NODE_ENV=development
    DATABASE_URL=postgresql://user:password@localhost:5432/jobspeedy
    JWT_SECRET=your-secret-key-change-in-production-use-a-long-random-string
+   AI_SERVICE_API_KEY=your-openai-api-key-here
    ```
+   
+   **Note:** For Vercel deployment, use `AI_SERVICE_API_KEY` or `JOBS_AI_API_KEY` instead of `OPENAI_API_KEY` to avoid conflicts. The AI features will work with either variable name, but will fall back to placeholder responses if not provided.
 
 4. **Set up PostgreSQL database**
    - Create a PostgreSQL database named `jobspeedy`
@@ -99,6 +102,7 @@ Complete backend API server for JobSpeedy AI platform with user and admin authen
 - `GET /api/applicants/:id` - Get applicant by ID
 
 ### AI Tools
+- `POST /api/parse-resume` - Parse resume and extract structured data (frontend endpoint)
 - `POST /api/tools/extract-skills` - Extract skills from resume
 
 ### Health Check

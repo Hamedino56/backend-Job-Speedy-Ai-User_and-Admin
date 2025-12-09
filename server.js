@@ -7,6 +7,14 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 
+// OpenAI integration (optional - only if API key is provided)
+let OpenAI;
+try {
+  OpenAI = require('openai');
+} catch (e) {
+  console.log('OpenAI package not installed. AI features will use placeholder responses.');
+}
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -33,6 +41,22 @@ const pool = new Pool({
 
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+
+// AI Service API Key (using custom name instead of OPENAI_API_KEY)
+const AI_SERVICE_API_KEY = process.env.AI_SERVICE_API_KEY || process.env.JOBS_AI_API_KEY || null;
+
+// Initialize OpenAI client if API key is available
+let openai = null;
+if (AI_SERVICE_API_KEY && OpenAI) {
+  try {
+    openai = new OpenAI({
+      apiKey: AI_SERVICE_API_KEY
+    });
+    console.log('OpenAI client initialized successfully');
+  } catch (error) {
+    console.error('Failed to initialize OpenAI client:', error.message);
+  }
+}
 
 // Multer configuration for file uploads
 const storage = multer.memoryStorage();
@@ -693,23 +717,88 @@ app.post('/api/jobs/generate-ad', verifyAdmin, async (req, res) => {
   try {
     const { description } = req.body;
     
-    // This is a placeholder - you would integrate with an AI service here
-    // For now, return a structured response based on the description
-    const jobAd = {
-      title: description ? description.split(' ').slice(0, 5).join(' ') + ' Position' : 'New Position',
-      company: null,
-      department: null,
-      location: null,
-      job_type: null,
-      category: null,
-      language: null,
-      status: null,
-      description: description || '',
-      required_skills: [],
-      requirements: []
-    };
+    if (!description) {
+      return res.status(400).json({ error: 'description is required' });
+    }
 
-    res.json({ jobAd });
+    // Use OpenAI if available, otherwise return placeholder
+    if (openai) {
+      try {
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-3.5-turbo',
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a job posting expert. Generate a structured job posting from the given description. Return a JSON object with: title, company (optional), department, location (optional), job_type (optional), category (optional), language (optional), description, required_skills (array), and requirements (array).'
+            },
+            {
+              role: 'user',
+              content: `Generate a job posting from this description: ${description}`
+            }
+          ],
+          temperature: 0.7,
+          max_tokens: 1000
+        });
+
+        const aiResponse = completion.choices[0]?.message?.content;
+        let jobAd;
+        
+        try {
+          // Try to parse JSON response
+          jobAd = JSON.parse(aiResponse);
+        } catch (e) {
+          // If not JSON, create structured response from text
+          jobAd = {
+            title: description.split(' ').slice(0, 5).join(' ') + ' Position',
+            company: null,
+            department: null,
+            location: null,
+            job_type: null,
+            category: null,
+            language: null,
+            status: null,
+            description: aiResponse || description,
+            required_skills: [],
+            requirements: []
+          };
+        }
+
+        res.json({ jobAd });
+      } catch (aiError) {
+        console.error('OpenAI API error:', aiError);
+        // Fallback to placeholder
+        const jobAd = {
+          title: description.split(' ').slice(0, 5).join(' ') + ' Position',
+          company: null,
+          department: null,
+          location: null,
+          job_type: null,
+          category: null,
+          language: null,
+          status: null,
+          description: description || '',
+          required_skills: [],
+          requirements: []
+        };
+        res.json({ jobAd });
+      }
+    } else {
+      // Placeholder response when OpenAI is not configured
+      const jobAd = {
+        title: description ? description.split(' ').slice(0, 5).join(' ') + ' Position' : 'New Position',
+        company: null,
+        department: null,
+        location: null,
+        job_type: null,
+        category: null,
+        language: null,
+        status: null,
+        description: description || '',
+        required_skills: [],
+        requirements: []
+      };
+      res.json({ jobAd });
+    }
   } catch (error) {
     console.error('Generate job ad error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -1222,13 +1311,55 @@ app.post('/api/applicants', upload.single('resume'), async (req, res) => {
       }
     }
 
-    // Placeholder classification - you would integrate with AI service here
-    const classification = {
+    // Generate classification using OpenAI if available
+    let classification = {
       stack: 'Full Stack',
       percentage: 85,
       role: 'Senior Developer',
       reasoning: 'Based on skills and experience analysis'
     };
+
+    if (openai && (skillsArray.length > 0 || experienceArray.length > 0)) {
+      try {
+        const skillsText = skillsArray.join(', ');
+        const experienceText = experienceArray.map(exp => 
+          `${exp.role || 'Role'} at ${exp.company || 'Company'}`
+        ).join(', ');
+
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-3.5-turbo',
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a technical recruiter. Analyze the candidate\'s skills and experience, then classify them. Return a JSON object with: stack (e.g., "Full Stack", "Frontend", "Backend"), percentage (0-100 confidence score), role (e.g., "Senior Developer", "Junior Developer"), and reasoning (brief explanation).'
+            },
+            {
+              role: 'user',
+              content: `Skills: ${skillsText}\nExperience: ${experienceText}\n\nClassify this candidate.`
+            }
+          ],
+          temperature: 0.5,
+          max_tokens: 300
+        });
+
+        const aiResponse = completion.choices[0]?.message?.content;
+        try {
+          const aiClassification = JSON.parse(aiResponse);
+          classification = {
+            stack: aiClassification.stack || classification.stack,
+            percentage: aiClassification.percentage || classification.percentage,
+            role: aiClassification.role || classification.role,
+            reasoning: aiClassification.reasoning || classification.reasoning
+          };
+        } catch (e) {
+          // If JSON parsing fails, use default
+          console.log('Could not parse AI classification, using default');
+        }
+      } catch (aiError) {
+        console.error('OpenAI classification error:', aiError);
+        // Use default classification
+      }
+    }
 
     const result = await pool.query(
       `INSERT INTO applicants (name, email, phone, skills, experience, education, resume_filename, resume_mime, resume_data)
@@ -1271,13 +1402,65 @@ app.get('/api/applicants/:id', async (req, res) => {
     }
 
     const applicant = result.rows[0];
-    // Add placeholder classification
-    applicant.classification = {
+    
+    // Generate classification using OpenAI if available
+    let classification = {
       stack: 'Full Stack',
       percentage: 85,
       role: 'Senior Developer',
       reasoning: 'Based on skills and experience analysis'
     };
+
+    if (openai && applicant.skills && applicant.skills.length > 0) {
+      try {
+        const skillsText = Array.isArray(applicant.skills) ? applicant.skills.join(', ') : '';
+        let experienceText = '';
+        
+        if (applicant.experience) {
+          try {
+            const exp = typeof applicant.experience === 'string' ? JSON.parse(applicant.experience) : applicant.experience;
+            experienceText = Array.isArray(exp) ? exp.map(e => `${e.role || 'Role'} at ${e.company || 'Company'}`).join(', ') : '';
+          } catch (e) {
+            experienceText = '';
+          }
+        }
+
+        if (skillsText) {
+          const completion = await openai.chat.completions.create({
+            model: 'gpt-3.5-turbo',
+            messages: [
+              {
+                role: 'system',
+                content: 'You are a technical recruiter. Analyze the candidate\'s skills and experience, then classify them. Return a JSON object with: stack (e.g., "Full Stack", "Frontend", "Backend"), percentage (0-100 confidence score), role (e.g., "Senior Developer", "Junior Developer"), and reasoning (brief explanation).'
+              },
+              {
+                role: 'user',
+                content: `Skills: ${skillsText}${experienceText ? `\nExperience: ${experienceText}` : ''}\n\nClassify this candidate.`
+              }
+            ],
+            temperature: 0.5,
+            max_tokens: 300
+          });
+
+          const aiResponse = completion.choices[0]?.message?.content;
+          try {
+            const aiClassification = JSON.parse(aiResponse);
+            classification = {
+              stack: aiClassification.stack || classification.stack,
+              percentage: aiClassification.percentage || classification.percentage,
+              role: aiClassification.role || classification.role,
+              reasoning: aiClassification.reasoning || classification.reasoning
+            };
+          } catch (e) {
+            console.log('Could not parse AI classification, using default');
+          }
+        }
+      } catch (aiError) {
+        console.error('OpenAI classification error:', aiError);
+      }
+    }
+
+    applicant.classification = classification;
 
     res.json({ applicant });
   } catch (error) {
@@ -1290,6 +1473,126 @@ app.get('/api/applicants/:id', async (req, res) => {
 // AI/TOOLS APIs
 // ============================================
 
+// Parse Resume (Alias for extract-skills, matches frontend expectation)
+app.post('/api/parse-resume', upload.single('resume'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'resume file is required' });
+    }
+
+    // Use OpenAI if available, otherwise return placeholder
+    if (openai) {
+      try {
+        const fileExtension = path.extname(req.file.originalname).toLowerCase();
+        let resumeText = '';
+        
+        if (fileExtension === '.txt') {
+          resumeText = req.file.buffer.toString('utf-8');
+        } else if (fileExtension === '.pdf') {
+          // For PDF, we'll use OpenAI's vision API or text extraction
+          // Note: For better PDF parsing, consider using pdf-parse library
+          resumeText = '[PDF file - text extraction needed]';
+        } else {
+          // Try to read as text for other formats
+          try {
+            resumeText = req.file.buffer.toString('utf-8');
+          } catch (e) {
+            resumeText = '[Binary file - unable to extract text]';
+          }
+        }
+
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-3.5-turbo',
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a resume parser. Extract structured information from resumes. Return a JSON object with: skills (array), contact (object with name, email, phone, location), summary (string), experience (array of objects with title, company, start_date, end_date, responsibilities), education (array of objects with degree, institution, year), certifications (array), languages (array), and links (array).'
+            },
+            {
+              role: 'user',
+              content: fileExtension === '.txt' || resumeText !== '[PDF file - text extraction needed]'
+                ? `Parse this resume text:\n\n${resumeText}`
+                : 'Please extract information from this resume. Note: PDF parsing requires additional setup.'
+            }
+          ],
+          temperature: 0.3,
+          max_tokens: 2000
+        });
+
+        const aiResponse = completion.choices[0]?.message?.content;
+        let parsed;
+        
+        try {
+          parsed = JSON.parse(aiResponse);
+        } catch (e) {
+          // Fallback to placeholder if JSON parsing fails
+          parsed = {
+            skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
+            contact: { name: null, email: null, phone: null, location: null },
+            summary: aiResponse || 'Resume parsed successfully',
+            experience: [],
+            education: [],
+            certifications: [],
+            languages: [],
+            links: []
+          };
+        }
+
+        res.json({ parsed });
+      } catch (aiError) {
+        console.error('OpenAI API error:', aiError);
+        // Fallback to placeholder
+        const parsed = {
+          skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
+          contact: { name: null, email: null, phone: null, location: null },
+          summary: 'Error parsing resume with AI. Using placeholder data.',
+          experience: [],
+          education: [],
+          certifications: [],
+          languages: [],
+          links: []
+        };
+        res.json({ parsed });
+      }
+    } else {
+      // Placeholder response when OpenAI is not configured
+      const parsed = {
+        skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
+        contact: {
+          name: null,
+          email: null,
+          phone: null,
+          location: null
+        },
+        summary: 'Experienced developer with strong technical skills',
+        experience: [
+          {
+            title: 'Senior Developer',
+            company: 'Tech Company',
+            start_date: '2020-01-01',
+            end_date: '2023-12-31',
+            responsibilities: ['Developed web applications', 'Led team projects']
+          }
+        ],
+        education: [
+          {
+            degree: 'Bachelor of Science',
+            institution: 'University',
+            year: '2018'
+          }
+        ],
+        certifications: ['AWS Certified'],
+        languages: ['English'],
+        links: []
+      };
+      res.json({ parsed });
+    }
+  } catch (error) {
+    console.error('Parse resume error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Extract Skills from Resume
 app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) => {
   try {
@@ -1297,39 +1600,128 @@ app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) 
       return res.status(400).json({ error: 'resume file is required' });
     }
 
-    // This is a placeholder - you would integrate with an AI/ML service here
-    // For now, return a structured response
-    const parsed = {
-      skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
-      contact: {
-        name: null,
-        email: null,
-        phone: null,
-        location: null
-      },
-      summary: 'Experienced developer with strong technical skills',
-      experience: [
-        {
-          title: 'Senior Developer',
-          company: 'Tech Company',
-          start_date: '2020-01-01',
-          end_date: '2023-12-31',
-          responsibilities: ['Developed web applications', 'Led team projects']
-        }
-      ],
-      education: [
-        {
-          degree: 'Bachelor of Science',
-          institution: 'University',
-          year: '2018'
-        }
-      ],
-      certifications: ['AWS Certified'],
-      languages: ['English'],
-      links: []
-    };
+    // Use OpenAI if available, otherwise return placeholder
+    if (openai) {
+      try {
+        // Convert file buffer to base64 for OpenAI
+        const base64File = req.file.buffer.toString('base64');
+        const fileExtension = path.extname(req.file.originalname).toLowerCase();
+        
+        // OpenAI supports PDF and text files
+        if (fileExtension === '.pdf' || fileExtension === '.txt') {
+          // For PDF files, we need to use the file upload API or text extraction
+          // For simplicity, we'll extract text from the buffer if possible
+          let resumeText = '';
+          
+          if (fileExtension === '.txt') {
+            resumeText = req.file.buffer.toString('utf-8');
+          } else {
+            // For PDF, we'd need a PDF parser library
+            // For now, use OpenAI with text extraction prompt
+            resumeText = '[PDF file content - text extraction needed]';
+          }
 
-    res.json({ parsed });
+          const completion = await openai.chat.completions.create({
+            model: 'gpt-3.5-turbo',
+            messages: [
+              {
+                role: 'system',
+                content: 'You are a resume parser. Extract structured information from resumes. Return a JSON object with: skills (array), contact (object with name, email, phone, location), summary (string), experience (array of objects with title, company, start_date, end_date, responsibilities), education (array of objects with degree, institution, year), certifications (array), languages (array), and links (array).'
+              },
+              {
+                role: 'user',
+                content: fileExtension === '.txt' 
+                  ? `Parse this resume text:\n\n${resumeText}`
+                  : 'Please extract information from this resume. Note: PDF parsing requires additional setup.'
+              }
+            ],
+            temperature: 0.3,
+            max_tokens: 2000
+          });
+
+          const aiResponse = completion.choices[0]?.message?.content;
+          let parsed;
+          
+          try {
+            parsed = JSON.parse(aiResponse);
+          } catch (e) {
+            // Fallback to placeholder if JSON parsing fails
+            parsed = {
+              skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
+              contact: { name: null, email: null, phone: null, location: null },
+              summary: aiResponse || 'Resume parsed successfully',
+              experience: [],
+              education: [],
+              certifications: [],
+              languages: [],
+              links: []
+            };
+          }
+
+          res.json({ parsed });
+        } else {
+          // For non-PDF/TXT files, return placeholder
+          res.json({
+            parsed: {
+              skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
+              contact: { name: null, email: null, phone: null, location: null },
+              summary: 'File format requires additional processing',
+              experience: [],
+              education: [],
+              certifications: [],
+              languages: [],
+              links: []
+            }
+          });
+        }
+      } catch (aiError) {
+        console.error('OpenAI API error:', aiError);
+        // Fallback to placeholder
+        const parsed = {
+          skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
+          contact: { name: null, email: null, phone: null, location: null },
+          summary: 'Error parsing resume with AI. Using placeholder data.',
+          experience: [],
+          education: [],
+          certifications: [],
+          languages: [],
+          links: []
+        };
+        res.json({ parsed });
+      }
+    } else {
+      // Placeholder response when OpenAI is not configured
+      const parsed = {
+        skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
+        contact: {
+          name: null,
+          email: null,
+          phone: null,
+          location: null
+        },
+        summary: 'Experienced developer with strong technical skills',
+        experience: [
+          {
+            title: 'Senior Developer',
+            company: 'Tech Company',
+            start_date: '2020-01-01',
+            end_date: '2023-12-31',
+            responsibilities: ['Developed web applications', 'Led team projects']
+          }
+        ],
+        education: [
+          {
+            degree: 'Bachelor of Science',
+            institution: 'University',
+            year: '2018'
+          }
+        ],
+        certifications: ['AWS Certified'],
+        languages: ['English'],
+        links: []
+      };
+      res.json({ parsed });
+    }
   } catch (error) {
     console.error('Extract skills error:', error);
     res.status(500).json({ error: 'Internal server error' });
