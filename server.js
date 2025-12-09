@@ -1,0 +1,1362 @@
+const express = require('express');
+const { Pool } = require('pg');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// CORS middleware
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgresql://user:password@localhost:5432/jobspeedy',
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+
+// Multer configuration for file uploads
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  fileFilter: (req, file, cb) => {
+    const allowedMimes = [
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'text/plain',
+      'application/rtf',
+      'text/rtf',
+      'application/vnd.oasis.opendocument.text'
+    ];
+    if (allowedMimes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only PDF, DOC, DOCX, TXT, RTF, ODT are allowed.'));
+    }
+  }
+});
+
+// Middleware: Verify JWT Token
+const verifyToken = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// Middleware: Verify Admin Token
+const verifyAdmin = async (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const result = await pool.query('SELECT id FROM admin_users WHERE id = $1', [decoded.id]);
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Admin access required' });
+    }
+    req.admin = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// ============================================
+// AUTHENTICATION APIs
+// ============================================
+
+// 1. User Registration
+app.post('/api/users/register', async (req, res) => {
+  try {
+    const { full_name, email, password, phone } = req.body;
+    
+    if (!full_name || !email || !password) {
+      return res.status(400).json({ error: 'full_name, email, and password are required' });
+    }
+
+    // Check if email already exists
+    const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existingUser.rows.length > 0) {
+      return res.status(409).json({ error: 'Email already exists' });
+    }
+
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Insert user
+    const result = await pool.query(
+      'INSERT INTO users (full_name, email, password_hash, phone) VALUES ($1, $2, $3, $4) RETURNING id, full_name, email, phone, created_at',
+      [full_name, email, passwordHash, phone || null]
+    );
+
+    const user = result.rows[0];
+
+    // Generate JWT token
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.status(201).json({
+      token,
+      user: {
+        id: user.id,
+        full_name: user.full_name,
+        email: user.email,
+        phone: user.phone,
+        created_at: user.created_at
+      }
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 2. User Login
+app.post('/api/users/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    // Find user
+    const result = await pool.query(
+      'SELECT id, full_name, email, phone, password_hash, created_at FROM users WHERE email = $1',
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const user = result.rows[0];
+
+    // Verify password
+    const isValid = await bcrypt.compare(password, user.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Generate JWT token
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        full_name: user.full_name,
+        email: user.email,
+        phone: user.phone,
+        created_at: user.created_at
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 3. Get Current User Profile
+app.get('/api/users/me', verifyToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, full_name, email, phone, created_at FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({ user: result.rows[0] });
+  } catch (error) {
+    console.error('Get user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 4. Admin Registration
+app.post('/api/admin/register', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    // Check if email already exists
+    const existingAdmin = await pool.query('SELECT id FROM admin_users WHERE email = $1', [email]);
+    if (existingAdmin.rows.length > 0) {
+      return res.status(409).json({ error: 'Email already exists' });
+    }
+
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Insert admin
+    const result = await pool.query(
+      'INSERT INTO admin_users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at',
+      [email, passwordHash]
+    );
+
+    const admin = result.rows[0];
+
+    // Generate JWT token
+    const token = jwt.sign({ id: admin.id, email: admin.email }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.status(201).json({
+      token,
+      admin: {
+        id: admin.id,
+        email: admin.email,
+        created_at: admin.created_at
+      }
+    });
+  } catch (error) {
+    console.error('Admin registration error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 5. Admin Login
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    // Find admin
+    const result = await pool.query(
+      'SELECT id, email, password_hash, created_at FROM admin_users WHERE email = $1',
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const admin = result.rows[0];
+
+    // Verify password
+    const isValid = await bcrypt.compare(password, admin.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Generate JWT token
+    const token = jwt.sign({ id: admin.id, email: admin.email }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.json({
+      token,
+      admin: {
+        id: admin.id,
+        email: admin.email,
+        created_at: admin.created_at
+      }
+    });
+  } catch (error) {
+    console.error('Admin login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Alternative Admin Auth Endpoints (for frontend compatibility)
+app.post('/api/auth/register-admin', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    const existingAdmin = await pool.query('SELECT id FROM admin_users WHERE email = $1', [email]);
+    if (existingAdmin.rows.length > 0) {
+      return res.status(409).json({ error: 'Email already exists' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      'INSERT INTO admin_users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at',
+      [email, passwordHash]
+    );
+    const admin = result.rows[0];
+    const token = jwt.sign({ id: admin.id, email: admin.email }, JWT_SECRET, { expiresIn: '7d' });
+    res.status(201).json({
+      user: {
+        id: admin.id,
+        email: admin.email
+      },
+      token
+    });
+  } catch (error) {
+    console.error('Admin registration error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/login-admin', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    const result = await pool.query(
+      'SELECT id, email, password_hash, created_at FROM admin_users WHERE email = $1',
+      [email]
+    );
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const admin = result.rows[0];
+    const isValid = await bcrypt.compare(password, admin.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const token = jwt.sign({ id: admin.id, email: admin.email }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({
+      user: {
+        id: admin.id,
+        email: admin.email
+      },
+      token
+    });
+  } catch (error) {
+    console.error('Admin login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+    if (!email || !newPassword) {
+      return res.status(400).json({ error: 'Email and newPassword are required' });
+    }
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    const result = await pool.query(
+      'UPDATE admin_users SET password_hash = $1 WHERE email = $2 RETURNING id',
+      [passwordHash, email]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Admin not found' });
+    }
+    res.json({ message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('Password reset error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// JOBS APIs
+// ============================================
+
+// Get All Jobs (Public)
+app.get('/api/jobs', async (req, res) => {
+  try {
+    const { search, location, job_type, category, status, department, limit, offset } = req.query;
+    
+    let query = `
+      SELECT 
+        j.*,
+        c.company,
+        j.location,
+        j.job_type,
+        j.category,
+        j.language
+      FROM jobs j
+      LEFT JOIN clients c ON j.client_id = c.id
+      WHERE 1=1
+    `;
+    const params = [];
+    let paramCount = 0;
+
+    if (search) {
+      paramCount++;
+      query += ` AND (j.title ILIKE $${paramCount} OR j.description ILIKE $${paramCount})`;
+      params.push(`%${search}%`);
+    }
+    if (location) {
+      paramCount++;
+      query += ` AND j.location = $${paramCount}`;
+      params.push(location);
+    }
+    if (job_type) {
+      paramCount++;
+      query += ` AND j.job_type = $${paramCount}`;
+      params.push(job_type);
+    }
+    if (category) {
+      paramCount++;
+      query += ` AND j.category = $${paramCount}`;
+      params.push(category);
+    }
+    if (status) {
+      paramCount++;
+      query += ` AND j.status = $${paramCount}`;
+      params.push(status);
+    }
+    if (department) {
+      paramCount++;
+      query += ` AND j.department = $${paramCount}`;
+      params.push(department);
+    }
+
+    // Build count query (same filters, no pagination)
+    let countQuery = `
+      SELECT COUNT(*) as count
+      FROM jobs j
+      LEFT JOIN clients c ON j.client_id = c.id
+      WHERE 1=1
+    `;
+    const countParams = [];
+    let countParamCount = 0;
+
+    if (search) {
+      countParamCount++;
+      countQuery += ` AND (j.title ILIKE $${countParamCount} OR j.description ILIKE $${countParamCount})`;
+      countParams.push(`%${search}%`);
+    }
+    if (location) {
+      countParamCount++;
+      countQuery += ` AND j.location = $${countParamCount}`;
+      countParams.push(location);
+    }
+    if (job_type) {
+      countParamCount++;
+      countQuery += ` AND j.job_type = $${countParamCount}`;
+      countParams.push(job_type);
+    }
+    if (category) {
+      countParamCount++;
+      countQuery += ` AND j.category = $${countParamCount}`;
+      countParams.push(category);
+    }
+    if (status) {
+      countParamCount++;
+      countQuery += ` AND j.status = $${countParamCount}`;
+      countParams.push(status);
+    }
+    if (department) {
+      countParamCount++;
+      countQuery += ` AND j.department = $${countParamCount}`;
+      countParams.push(department);
+    }
+
+    query += ' ORDER BY j.created_at DESC';
+
+    if (limit) {
+      paramCount++;
+      query += ` LIMIT $${paramCount}`;
+      params.push(parseInt(limit));
+    }
+    if (offset) {
+      paramCount++;
+      query += ` OFFSET $${paramCount}`;
+      params.push(parseInt(offset));
+    }
+
+    const [result, countResult] = await Promise.all([
+      pool.query(query, params),
+      pool.query(countQuery, countParams)
+    ]);
+
+    res.json({
+      jobs: result.rows,
+      count: parseInt(countResult.rows[0].count)
+    });
+  } catch (error) {
+    console.error('Get jobs error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get Single Job by ID (Public)
+app.get('/api/jobs/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT 
+        j.*,
+        c.company,
+        j.location,
+        j.job_type,
+        j.category,
+        j.language
+      FROM jobs j
+      LEFT JOIN clients c ON j.client_id = c.id
+      WHERE j.id = $1`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    res.json({ job: result.rows[0] });
+  } catch (error) {
+    console.error('Get job error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create Job (Admin Only)
+app.post('/api/jobs', verifyAdmin, async (req, res) => {
+  try {
+    const { title, department, description, requirements, status, created_by, client_id, location, job_type, category, language } = req.body;
+
+    if (!title || !department) {
+      return res.status(400).json({ error: 'title and department are required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO jobs (title, department, description, requirements, status, created_by, client_id, location, job_type, category, language)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING *`,
+      [
+        title,
+        department,
+        description || null,
+        requirements || [],
+        status || 'Open',
+        created_by || 'Admin',
+        client_id || null,
+        location || null,
+        job_type || null,
+        category || null,
+        language || null
+      ]
+    );
+
+    res.status(201).json({ job: result.rows[0] });
+  } catch (error) {
+    console.error('Create job error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update Job (Admin Only)
+app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, department, description, requirements, status, location, job_type, category, language } = req.body;
+
+    const updates = [];
+    const values = [];
+    let paramCount = 0;
+
+    if (title !== undefined) {
+      paramCount++;
+      updates.push(`title = $${paramCount}`);
+      values.push(title);
+    }
+    if (department !== undefined) {
+      paramCount++;
+      updates.push(`department = $${paramCount}`);
+      values.push(department);
+    }
+    if (description !== undefined) {
+      paramCount++;
+      updates.push(`description = $${paramCount}`);
+      values.push(description);
+    }
+    if (requirements !== undefined) {
+      paramCount++;
+      updates.push(`requirements = $${paramCount}`);
+      values.push(requirements);
+    }
+    if (status !== undefined) {
+      paramCount++;
+      updates.push(`status = $${paramCount}`);
+      values.push(status);
+    }
+    if (location !== undefined) {
+      paramCount++;
+      updates.push(`location = $${paramCount}`);
+      values.push(location);
+    }
+    if (job_type !== undefined) {
+      paramCount++;
+      updates.push(`job_type = $${paramCount}`);
+      values.push(job_type);
+    }
+    if (category !== undefined) {
+      paramCount++;
+      updates.push(`category = $${paramCount}`);
+      values.push(category);
+    }
+    if (language !== undefined) {
+      paramCount++;
+      updates.push(`language = $${paramCount}`);
+      values.push(language);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    paramCount++;
+    updates.push(`updated_at = NOW()`);
+    paramCount++;
+    values.push(id);
+
+    const result = await pool.query(
+      `UPDATE jobs SET ${updates.join(', ')} WHERE id = $${paramCount} RETURNING *`,
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    res.json({ job: result.rows[0] });
+  } catch (error) {
+    console.error('Update job error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete Job (Admin Only)
+app.delete('/api/jobs/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('DELETE FROM jobs WHERE id = $1 RETURNING id', [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    res.json({ success: true, message: 'Job deleted successfully', id: parseInt(id) });
+  } catch (error) {
+    console.error('Delete job error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get Applications for a Job (Admin Only)
+app.get('/api/jobs/:jobId/applications', verifyAdmin, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const result = await pool.query(
+      `SELECT 
+        a.*,
+        u.full_name,
+        u.email
+      FROM applications a
+      LEFT JOIN users u ON a.user_id = u.id
+      WHERE a.job_id = $1
+      ORDER BY a.created_at DESC`,
+      [jobId]
+    );
+
+    res.json({
+      applications: result.rows,
+      count: result.rows.length
+    });
+  } catch (error) {
+    console.error('Get job applications error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Generate Job Ad (Admin Only)
+app.post('/api/jobs/generate-ad', verifyAdmin, async (req, res) => {
+  try {
+    const { description } = req.body;
+    
+    // This is a placeholder - you would integrate with an AI service here
+    // For now, return a structured response based on the description
+    const jobAd = {
+      title: description ? description.split(' ').slice(0, 5).join(' ') + ' Position' : 'New Position',
+      company: null,
+      department: null,
+      location: null,
+      job_type: null,
+      category: null,
+      language: null,
+      status: null,
+      description: description || '',
+      required_skills: [],
+      requirements: []
+    };
+
+    res.json({ jobAd });
+  } catch (error) {
+    console.error('Generate job ad error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get XML Feed for Job Portal
+app.get('/api/jobs/:id/xml-feed/:portal', async (req, res) => {
+  try {
+    const { id, portal } = req.params;
+    const result = await pool.query(
+      `SELECT j.*, c.company FROM jobs j LEFT JOIN clients c ON j.client_id = c.id WHERE j.id = $1`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    const job = result.rows[0];
+    let xml = '<?xml version="1.0" encoding="UTF-8"?>\n<job>\n';
+    xml += `  <title>${escapeXml(job.title)}</title>\n`;
+    xml += `  <description>${escapeXml(job.description || '')}</description>\n`;
+    if (job.company) xml += `  <company>${escapeXml(job.company)}</company>\n`;
+    if (job.location) xml += `  <location>${escapeXml(job.location)}</location>\n`;
+    xml += '</job>';
+
+    res.set('Content-Type', 'application/xml');
+    res.send(xml);
+  } catch (error) {
+    console.error('XML feed error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+function escapeXml(unsafe) {
+  return unsafe.replace(/[<>&'"]/g, (c) => {
+    switch (c) {
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '&': return '&amp;';
+      case '\'': return '&apos;';
+      case '"': return '&quot;';
+      default: return c;
+    }
+  });
+}
+
+// ============================================
+// APPLICATIONS APIs
+// ============================================
+
+// Create Application (User)
+app.post('/api/applications', verifyToken, upload.single('resume'), async (req, res) => {
+  try {
+    const { job_id, cover_letter, name, email, phone, ai_parsed_data } = req.body;
+
+    if (!job_id) {
+      return res.status(400).json({ error: 'job_id is required' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'resume file is required' });
+    }
+
+    // Check if user already applied
+    const existingApp = await pool.query(
+      'SELECT id FROM applications WHERE user_id = $1 AND job_id = $2',
+      [req.user.id, job_id]
+    );
+
+    if (existingApp.rows.length > 0) {
+      return res.status(409).json({ error: 'You have already applied for this job' });
+    }
+
+    // Parse AI data if provided
+    let parsedData = null;
+    if (ai_parsed_data) {
+      try {
+        parsedData = typeof ai_parsed_data === 'string' ? JSON.parse(ai_parsed_data) : ai_parsed_data;
+      } catch (e) {
+        console.error('Error parsing AI data:', e);
+      }
+    }
+
+    const result = await pool.query(
+      `INSERT INTO applications (user_id, job_id, resume_data, resume_filename, resume_mime, cover_letter, ai_parsed_data)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, user_id, job_id, resume_url, resume_filename, resume_mime, cover_letter, status, ai_parsed_data, admin_notes, created_at, updated_at`,
+      [
+        req.user.id,
+        job_id,
+        req.file.buffer,
+        req.file.originalname,
+        req.file.mimetype,
+        cover_letter || null,
+        parsedData ? JSON.stringify(parsedData) : null
+      ]
+    );
+
+    res.status(201).json({ application: result.rows[0] });
+  } catch (error) {
+    console.error('Create application error:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// Get All Applications (Admin Only)
+app.get('/api/applications', verifyAdmin, async (req, res) => {
+  try {
+    const { status, user_id, job_id, limit, offset } = req.query;
+
+    let query = `
+      SELECT 
+        a.*,
+        u.full_name,
+        u.email,
+        j.title as job_title,
+        j.department
+      FROM applications a
+      LEFT JOIN users u ON a.user_id = u.id
+      LEFT JOIN jobs j ON a.job_id = j.id
+      WHERE 1=1
+    `;
+    const params = [];
+    let paramCount = 0;
+
+    if (status) {
+      paramCount++;
+      query += ` AND a.status = $${paramCount}`;
+      params.push(status);
+    }
+    if (user_id) {
+      paramCount++;
+      query += ` AND a.user_id = $${paramCount}`;
+      params.push(user_id);
+    }
+    if (job_id) {
+      paramCount++;
+      query += ` AND a.job_id = $${paramCount}`;
+      params.push(job_id);
+    }
+
+    query += ' ORDER BY a.created_at DESC';
+
+    if (limit) {
+      paramCount++;
+      query += ` LIMIT $${paramCount}`;
+      params.push(parseInt(limit));
+    }
+    if (offset) {
+      paramCount++;
+      query += ` OFFSET $${paramCount}`;
+      params.push(parseInt(offset));
+    }
+
+    const result = await pool.query(query, params);
+
+    res.json({
+      applications: result.rows,
+      count: result.rows.length
+    });
+  } catch (error) {
+    console.error('Get applications error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get Single Application
+app.get('/api/applications/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Check if user is admin or owns the application
+    const isAdmin = await pool.query('SELECT id FROM admin_users WHERE id = $1', [req.user.id]);
+    const result = await pool.query('SELECT * FROM applications WHERE id = $1', [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+
+    const application = result.rows[0];
+    
+    // If not admin, check if user owns the application
+    if (isAdmin.rows.length === 0 && application.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    res.json({ application });
+  } catch (error) {
+    console.error('Get application error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update Application (Admin Only)
+app.put('/api/applications/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, admin_notes } = req.body;
+
+    const updates = [];
+    const values = [];
+    let paramCount = 0;
+
+    if (status !== undefined) {
+      paramCount++;
+      updates.push(`status = $${paramCount}`);
+      values.push(status);
+    }
+    if (admin_notes !== undefined) {
+      paramCount++;
+      updates.push(`admin_notes = $${paramCount}`);
+      values.push(admin_notes);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    paramCount++;
+    updates.push(`updated_at = NOW()`);
+    paramCount++;
+    values.push(id);
+
+    const result = await pool.query(
+      `UPDATE applications SET ${updates.join(', ')} WHERE id = $${paramCount} RETURNING *`,
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+
+    res.json({ application: result.rows[0] });
+  } catch (error) {
+    console.error('Update application error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete Application (Admin Only)
+app.delete('/api/applications/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('DELETE FROM applications WHERE id = $1 RETURNING id', [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+
+    res.json({ success: true, message: 'Application deleted successfully' });
+  } catch (error) {
+    console.error('Delete application error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// USERS (CANDIDATES) APIs
+// ============================================
+
+// Get All Users (Admin Only)
+app.get('/api/users', verifyAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, full_name, email, phone, created_at FROM users ORDER BY created_at DESC'
+    );
+
+    res.json({ users: result.rows });
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get User by ID (Admin Only)
+app.get('/api/users/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'SELECT id, full_name, email, phone, created_at FROM users WHERE id = $1',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({ user: result.rows[0] });
+  } catch (error) {
+    console.error('Get user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete User (Admin Only)
+app.delete('/api/users/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING id', [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({ message: 'User deleted successfully', id: parseInt(id) });
+  } catch (error) {
+    console.error('Delete user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get User Applications (Admin Only)
+app.get('/api/users/:id/applications', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT 
+        a.id,
+        a.user_id,
+        a.job_id,
+        j.title as job_title,
+        j.description as job_description,
+        a.status,
+        a.resume_url,
+        a.resume_filename,
+        a.ai_parsed_data,
+        a.created_at
+      FROM applications a
+      LEFT JOIN jobs j ON a.job_id = j.id
+      WHERE a.user_id = $1
+      ORDER BY a.created_at DESC`,
+      [id]
+    );
+
+    res.json({ applications: result.rows });
+  } catch (error) {
+    console.error('Get user applications error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get Anonymized PDF (Admin Only)
+app.get('/api/users/:id/anonymized-pdf', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userResult = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // This is a placeholder - you would generate a PDF here
+    // For now, return a simple text response
+    res.set('Content-Type', 'application/pdf');
+    res.send('PDF generation not implemented yet');
+  } catch (error) {
+    console.error('Get anonymized PDF error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// CLIENTS APIs
+// ============================================
+
+// Get All Clients (Admin Only)
+app.get('/api/clients', verifyAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT 
+        c.*,
+        COUNT(j.id) as jobs_count
+      FROM clients c
+      LEFT JOIN jobs j ON c.id = j.client_id
+      GROUP BY c.id
+      ORDER BY c.created_at DESC`
+    );
+
+    res.json({ clients: result.rows });
+  } catch (error) {
+    console.error('Get clients error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create Client (Admin Only)
+app.post('/api/clients', verifyAdmin, async (req, res) => {
+  try {
+    const { company, contact_person, email } = req.body;
+
+    if (!company) {
+      return res.status(400).json({ error: 'company is required' });
+    }
+
+    const result = await pool.query(
+      'INSERT INTO clients (company, contact_person, email) VALUES ($1, $2, $3) RETURNING *',
+      [company, contact_person || null, email || null]
+    );
+
+    res.status(201).json({ client: result.rows[0] });
+  } catch (error) {
+    if (error.code === '23505') { // Unique violation
+      return res.status(409).json({ error: 'Company already exists' });
+    }
+    console.error('Create client error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update Client (Admin Only)
+app.put('/api/clients/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { company, contact_person, email } = req.body;
+
+    const updates = [];
+    const values = [];
+    let paramCount = 0;
+
+    if (company !== undefined) {
+      paramCount++;
+      updates.push(`company = $${paramCount}`);
+      values.push(company);
+    }
+    if (contact_person !== undefined) {
+      paramCount++;
+      updates.push(`contact_person = $${paramCount}`);
+      values.push(contact_person);
+    }
+    if (email !== undefined) {
+      paramCount++;
+      updates.push(`email = $${paramCount}`);
+      values.push(email);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    paramCount++;
+    values.push(id);
+
+    const result = await pool.query(
+      `UPDATE clients SET ${updates.join(', ')} WHERE id = $${paramCount} RETURNING *`,
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Client not found' });
+    }
+
+    res.json({ client: result.rows[0] });
+  } catch (error) {
+    console.error('Update client error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete Client (Admin Only)
+app.delete('/api/clients/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('DELETE FROM clients WHERE id = $1 RETURNING id', [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Client not found' });
+    }
+
+    res.json({ message: 'Client deleted successfully', id: parseInt(id) });
+  } catch (error) {
+    console.error('Delete client error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// APPLICANTS APIs (Resume Parsing)
+// ============================================
+
+// Create/Parse Applicant Resume
+app.post('/api/applicants', upload.single('resume'), async (req, res) => {
+  try {
+    const { name, email, phone, skills, experience, education } = req.body;
+
+    if (!name || !email) {
+      return res.status(400).json({ error: 'name and email are required' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'resume file is required' });
+    }
+
+    let skillsArray = [];
+    if (skills) {
+      try {
+        skillsArray = typeof skills === 'string' ? JSON.parse(skills) : skills;
+      } catch (e) {
+        skillsArray = Array.isArray(skills) ? skills : [];
+      }
+    }
+
+    let experienceArray = [];
+    if (experience) {
+      try {
+        experienceArray = typeof experience === 'string' ? JSON.parse(experience) : experience;
+      } catch (e) {
+        experienceArray = Array.isArray(experience) ? experience : [];
+      }
+    }
+
+    // Placeholder classification - you would integrate with AI service here
+    const classification = {
+      stack: 'Full Stack',
+      percentage: 85,
+      role: 'Senior Developer',
+      reasoning: 'Based on skills and experience analysis'
+    };
+
+    const result = await pool.query(
+      `INSERT INTO applicants (name, email, phone, skills, experience, education, resume_filename, resume_mime, resume_data)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, name, email, phone, skills, experience, education, created_at`,
+      [
+        name,
+        email,
+        phone || null,
+        skillsArray,
+        JSON.stringify(experienceArray),
+        education || null,
+        req.file.originalname,
+        req.file.mimetype,
+        req.file.buffer
+      ]
+    );
+
+    const applicant = result.rows[0];
+    applicant.classification = classification;
+
+    res.status(201).json({ applicant });
+  } catch (error) {
+    console.error('Create applicant error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get Applicant by ID
+app.get('/api/applicants/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'SELECT id, name, email, phone, skills, experience, education, created_at FROM applicants WHERE id = $1',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Applicant not found' });
+    }
+
+    const applicant = result.rows[0];
+    // Add placeholder classification
+    applicant.classification = {
+      stack: 'Full Stack',
+      percentage: 85,
+      role: 'Senior Developer',
+      reasoning: 'Based on skills and experience analysis'
+    };
+
+    res.json({ applicant });
+  } catch (error) {
+    console.error('Get applicant error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// AI/TOOLS APIs
+// ============================================
+
+// Extract Skills from Resume
+app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'resume file is required' });
+    }
+
+    // This is a placeholder - you would integrate with an AI/ML service here
+    // For now, return a structured response
+    const parsed = {
+      skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
+      contact: {
+        name: null,
+        email: null,
+        phone: null,
+        location: null
+      },
+      summary: 'Experienced developer with strong technical skills',
+      experience: [
+        {
+          title: 'Senior Developer',
+          company: 'Tech Company',
+          start_date: '2020-01-01',
+          end_date: '2023-12-31',
+          responsibilities: ['Developed web applications', 'Led team projects']
+        }
+      ],
+      education: [
+        {
+          degree: 'Bachelor of Science',
+          institution: 'University',
+          year: '2018'
+        }
+      ],
+      certifications: ['AWS Certified'],
+      languages: ['English'],
+      links: []
+    };
+
+    res.json({ parsed });
+  } catch (error) {
+    console.error('Extract skills error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// Health Check
+// ============================================
+
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', database: 'connected' });
+  } catch (error) {
+    res.status(500).json({ status: 'error', database: 'disconnected' });
+  }
+});
+
+// ============================================
+// Start Server
+// ============================================
+
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
+});
+
+module.exports = app;
+
