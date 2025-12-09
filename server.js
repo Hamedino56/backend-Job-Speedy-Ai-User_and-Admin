@@ -76,7 +76,10 @@ const upload = multer({
     if (allowedMimes.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Invalid file type. Only PDF, DOC, DOCX, TXT, RTF, ODT are allowed.'));
+      // Store error in request for better handling
+      const error = new Error(`Invalid file type: ${file.mimetype}. Only PDF, DOC, DOCX, TXT, RTF, ODT are allowed.`);
+      req.fileValidationError = error.message;
+      cb(error, false);
     }
   }
 });
@@ -1474,11 +1477,81 @@ app.get('/api/applicants/:id', async (req, res) => {
 // ============================================
 
 // Parse Resume (Alias for extract-skills, matches frontend expectation)
-app.post('/api/parse-resume', upload.single('resume'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'resume file is required' });
+// Support multiple field names: 'resume', 'file', 'document'
+app.post('/api/parse-resume', (req, res, next) => {
+  // Try 'resume' first, then 'file', then 'document'
+  const uploadMiddleware = upload.fields([
+    { name: 'resume', maxCount: 1 },
+    { name: 'file', maxCount: 1 },
+    { name: 'document', maxCount: 1 }
+  ]);
+  
+  uploadMiddleware(req, res, (err) => {
+    if (err) {
+      // Handle multer errors
+      if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ 
+            error: 'File too large',
+            message: 'File size exceeds 10MB limit'
+          });
+        }
+        return res.status(400).json({ 
+          error: 'File upload error',
+          message: err.message
+        });
+      }
+      // Handle file validation errors
+      if (err.message && err.message.includes('Invalid file type')) {
+        return res.status(400).json({ 
+          error: 'Invalid file type',
+          message: err.message
+        });
+      }
+      return res.status(400).json({ 
+        error: 'File upload error',
+        message: err.message || 'Failed to process file upload'
+      });
     }
+    next();
+  });
+}, async (req, res) => {
+  try {
+    // Handle multer errors
+    if (req.fileValidationError) {
+      return res.status(400).json({ error: req.fileValidationError });
+    }
+
+    // Get file from any of the supported field names
+    let file = null;
+    if (req.files) {
+      file = req.files['resume']?.[0] || req.files['file']?.[0] || req.files['document']?.[0];
+    }
+    // Fallback to req.file for single field uploads
+    if (!file) {
+      file = req.file;
+    }
+    
+    if (!file) {
+      // Provide helpful error message
+      const errorMessage = req.body && Object.keys(req.body).length > 0
+        ? 'No file received. Make sure the file field is named "resume", "file", or "document" and Content-Type is multipart/form-data'
+        : 'Please upload a resume file. Supported formats: PDF, DOC, DOCX, TXT, RTF, ODT. Use multipart/form-data with field name "resume", "file", or "document"';
+      
+      return res.status(400).json({ 
+        error: 'resume file is required',
+        message: errorMessage,
+        details: {
+          acceptedFieldNames: ['resume', 'file', 'document'],
+          contentType: 'multipart/form-data',
+          supportedFormats: ['PDF', 'DOC', 'DOCX', 'TXT', 'RTF', 'ODT'],
+          maxSize: '10MB'
+        }
+      });
+    }
+    
+    // Set req.file for compatibility with rest of code
+    req.file = file;
 
     // Use OpenAI if available, otherwise return placeholder
     if (openai) {
@@ -1589,7 +1662,33 @@ app.post('/api/parse-resume', upload.single('resume'), async (req, res) => {
     }
   } catch (error) {
     console.error('Parse resume error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    
+    // Handle multer errors specifically
+    if (error instanceof multer.MulterError) {
+      if (error.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ 
+          error: 'File too large',
+          message: 'File size exceeds 10MB limit'
+        });
+      }
+      return res.status(400).json({ 
+        error: 'File upload error',
+        message: error.message
+      });
+    }
+    
+    // Handle other errors
+    if (error.message && error.message.includes('Invalid file type')) {
+      return res.status(400).json({ 
+        error: 'Invalid file type',
+        message: error.message
+      });
+    }
+    
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message || 'An unexpected error occurred'
+    });
   }
 });
 
