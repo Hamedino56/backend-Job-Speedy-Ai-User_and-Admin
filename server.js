@@ -1284,109 +1284,34 @@ app.delete('/api/clients/:id', verifyAdmin, async (req, res) => {
 // ============================================
 
 // Create/Parse Applicant Resume
-// Supports both JSON payload (with parsed data) and file upload
-app.post('/api/applicants', async (req, res) => {
+app.post('/api/applicants', upload.single('resume'), async (req, res) => {
   try {
-    let name, email, phone, skillsArray = [], experienceArray = [], education = '';
-    let resumeFile = null;
-    let resumeFilename = null;
-    let resumeMime = null;
-    let resumeData = null;
-
-    // Check if request is JSON with parsed data (from /api/parse-resume)
-    if (req.body && req.body.name && req.body.email) {
-      // Handle JSON payload from frontend (after parsing)
-      name = req.body.name;
-      email = req.body.email;
-      phone = req.body.phone || null;
-      
-      // Extract parsed data if provided
-      if (req.body.parsed) {
-        const parsed = req.body.parsed;
-        skillsArray = parsed.skills || [];
-        experienceArray = parsed.experience || [];
-        education = parsed.education ? (Array.isArray(parsed.education) ? parsed.education.map(e => `${e.degree || ''} ${e.institution || ''} ${e.year || ''}`).join(', ') : parsed.education) : '';
-        
-        // Extract contact info from parsed data if name/email not provided
-        if (parsed.contact) {
-          if (!name && parsed.contact.name) name = parsed.contact.name;
-          if (!email && parsed.contact.email) email = parsed.contact.email;
-          if (!phone && parsed.contact.phone) phone = parsed.contact.phone;
-        }
-      } else {
-        // Fallback to direct skills/experience if provided
-        if (req.body.skills) {
-          try {
-            skillsArray = typeof req.body.skills === 'string' ? JSON.parse(req.body.skills) : req.body.skills;
-          } catch (e) {
-            skillsArray = Array.isArray(req.body.skills) ? req.body.skills : [];
-          }
-        }
-        if (req.body.experience) {
-          try {
-            experienceArray = typeof req.body.experience === 'string' ? JSON.parse(req.body.experience) : req.body.experience;
-          } catch (e) {
-            experienceArray = Array.isArray(req.body.experience) ? req.body.experience : [];
-          }
-        }
-        education = req.body.education || '';
-      }
-    } else {
-      // Handle file upload (multipart/form-data)
-      const uploadMiddleware = upload.single('resume');
-      await new Promise((resolve, reject) => {
-        uploadMiddleware(req, res, (err) => {
-          if (err) {
-            if (err instanceof multer.MulterError) {
-              if (err.code === 'LIMIT_FILE_SIZE') {
-                return res.status(400).json({ error: 'File too large', message: 'File size exceeds 10MB limit' });
-              }
-              return res.status(400).json({ error: 'File upload error', message: err.message });
-            }
-            return res.status(400).json({ error: 'File upload error', message: err.message || 'Failed to process file upload' });
-          }
-          resolve();
-        });
-      });
-
-      name = req.body.name;
-      email = req.body.email;
-      phone = req.body.phone || null;
-      resumeFile = req.file;
-      
-      if (!name || !email) {
-        return res.status(400).json({ error: 'name and email are required' });
-      }
-
-      if (!resumeFile) {
-        return res.status(400).json({ error: 'resume file is required' });
-      }
-
-      resumeFilename = resumeFile.originalname;
-      resumeMime = resumeFile.mimetype;
-      resumeData = resumeFile.buffer;
-
-      // Parse skills and experience from body if provided
-      if (req.body.skills) {
-        try {
-          skillsArray = typeof req.body.skills === 'string' ? JSON.parse(req.body.skills) : req.body.skills;
-        } catch (e) {
-          skillsArray = Array.isArray(req.body.skills) ? req.body.skills : [];
-        }
-      }
-
-      if (req.body.experience) {
-        try {
-          experienceArray = typeof req.body.experience === 'string' ? JSON.parse(req.body.experience) : req.body.experience;
-        } catch (e) {
-          experienceArray = Array.isArray(req.body.experience) ? req.body.experience : [];
-        }
-      }
-      education = req.body.education || '';
-    }
+    const { name, email, phone, skills, experience, education } = req.body;
 
     if (!name || !email) {
       return res.status(400).json({ error: 'name and email are required' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'resume file is required' });
+    }
+
+    let skillsArray = [];
+    if (skills) {
+      try {
+        skillsArray = typeof skills === 'string' ? JSON.parse(skills) : skills;
+      } catch (e) {
+        skillsArray = Array.isArray(skills) ? skills : [];
+      }
+    }
+
+    let experienceArray = [];
+    if (experience) {
+      try {
+        experienceArray = typeof experience === 'string' ? JSON.parse(experience) : experience;
+      } catch (e) {
+        experienceArray = Array.isArray(experience) ? experience : [];
+      }
     }
 
     // Generate classification using OpenAI if available
@@ -1397,33 +1322,23 @@ app.post('/api/applicants', async (req, res) => {
       reasoning: 'Based on skills and experience analysis'
     };
 
-    // Always try to generate classification if we have data
     if (openai && (skillsArray.length > 0 || experienceArray.length > 0)) {
       try {
-        const skillsText = skillsArray.length > 0 ? skillsArray.join(', ') : 'No skills listed';
-        let experienceText = '';
-        
-        if (experienceArray.length > 0) {
-          experienceText = experienceArray.map(exp => {
-            if (typeof exp === 'object') {
-              return `${exp.title || exp.role || 'Role'} at ${exp.company || 'Company'}${exp.start_date ? ` (${exp.start_date}${exp.end_date ? ` - ${exp.end_date}` : ''})` : ''}`;
-            }
-            return String(exp);
-          }).join(', ');
-        } else {
-          experienceText = 'No experience listed';
-        }
+        const skillsText = skillsArray.join(', ');
+        const experienceText = experienceArray.map(exp => 
+          `${exp.role || 'Role'} at ${exp.company || 'Company'}`
+        ).join(', ');
 
         const completion = await openai.chat.completions.create({
           model: 'gpt-3.5-turbo',
           messages: [
             {
               role: 'system',
-              content: 'You are a technical recruiter. Analyze the candidate\'s skills and experience, then classify them. Return a JSON object with: stack (e.g., "Full Stack", "Frontend", "Backend", "AI/ML", "Data Science"), percentage (0-100 confidence score), role (e.g., "Senior Developer", "Junior Developer", "AI Engineer", "Data Scientist"), and reasoning (brief explanation of why this classification was chosen).'
+              content: 'You are a technical recruiter. Analyze the candidate\'s skills and experience, then classify them. Return a JSON object with: stack (e.g., "Full Stack", "Frontend", "Backend"), percentage (0-100 confidence score), role (e.g., "Senior Developer", "Junior Developer"), and reasoning (brief explanation).'
             },
             {
               role: 'user',
-              content: `Candidate: ${name}\nSkills: ${skillsText}\nExperience: ${experienceText}${education ? `\nEducation: ${education}` : ''}\n\nClassify this candidate based on their skills and experience.`
+              content: `Skills: ${skillsText}\nExperience: ${experienceText}\n\nClassify this candidate.`
             }
           ],
           temperature: 0.5,
@@ -1440,6 +1355,7 @@ app.post('/api/applicants', async (req, res) => {
             reasoning: aiClassification.reasoning || classification.reasoning
           };
         } catch (e) {
+          // If JSON parsing fails, use default
           console.log('Could not parse AI classification, using default');
         }
       } catch (aiError) {
@@ -1459,9 +1375,9 @@ app.post('/api/applicants', async (req, res) => {
         skillsArray,
         JSON.stringify(experienceArray),
         education || null,
-        resumeFilename,
-        resumeMime,
-        resumeData
+        req.file.originalname,
+        req.file.mimetype,
+        req.file.buffer
       ]
     );
 
