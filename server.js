@@ -6,11 +6,19 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
-let pdfParse = null;
+
+// Document parsers (PDF, DOC/DOCX)
+let pdfjsLib = null;
+let mammoth = null;
 try {
-  pdfParse = require('pdf-parse');
+  pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
 } catch (e) {
-  console.log('pdf-parse not installed; PDF resume parsing will use fallbacks until installed.');
+  console.log('pdfjs-dist not installed; PDF parsing will use fallback.');
+}
+try {
+  mammoth = require('mammoth');
+} catch (e) {
+  console.log('mammoth not installed; DOC/DOCX parsing will use fallback.');
 }
 
 // OpenAI integration (optional - only if API key is provided)
@@ -93,6 +101,48 @@ const upload = multer({
     }
   }
 });
+
+// Helper: extract text from uploaded resume (PDF, DOC/DOCX, TXT)
+async function extractResumeText(file) {
+  const ext = (path.extname(file?.originalname || '') || '').toLowerCase();
+
+  // PDF via pdfjs-dist if available
+  if (ext === '.pdf' && pdfjsLib) {
+    try {
+      const loadingTask = pdfjsLib.getDocument({ data: file.buffer });
+      const pdf = await loadingTask.promise;
+      let text = '';
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        text += content.items.map((item) => item.str).join(' ') + '\n';
+      }
+      if (text.trim()) return text;
+    } catch (e) {
+      console.error('PDF parse error (pdfjs):', e.message);
+    }
+  }
+
+  // DOC/DOCX via mammoth if available
+  if ((ext === '.docx' || ext === '.doc') && mammoth) {
+    try {
+      const result = await mammoth.extractRawText({ buffer: file.buffer });
+      if (result.value && result.value.trim()) return result.value;
+    } catch (e) {
+      console.error('DOC/DOCX parse error (mammoth):', e.message);
+    }
+  }
+
+  // Plain text / RTF / fallback decode
+  try {
+    const text = file.buffer.toString('utf-8');
+    if (text.trim()) return text;
+  } catch (e) {
+    console.error('Fallback text decode error:', e.message);
+  }
+
+  return '';
+}
 
 // Middleware: Verify JWT Token
 const verifyToken = (req, res, next) => {
@@ -1988,33 +2038,13 @@ app.post('/api/parse-resume', async (req, res) => {
     filename = file.originalname;
     fileExtension = path.extname(filename).toLowerCase();
 
-    // Extract text from file
-    if (fileExtension === '.txt') {
-      resumeText = file.buffer.toString('utf-8');
-    } else if (fileExtension === '.pdf') {
-      if (pdfParse) {
-        try {
-          const parsed = await pdfParse(file.buffer);
-          resumeText = parsed.text || '';
-        } catch (pdfErr) {
-          return res.status(400).json({
-            error: 'PDF parsing failed',
-            message: pdfErr.message || 'Unable to extract text from PDF'
-          });
-        }
-      } else {
-        return res.status(400).json({
-          error: 'PDF parsing not enabled',
-          message: 'Install pdf-parse to extract text from PDF resumes (npm install pdf-parse)'
-        });
-      }
-    } else {
-      // Try to read as text for other formats
-      try {
-        resumeText = file.buffer.toString('utf-8');
-      } catch (e) {
-        resumeText = '[Binary file - unable to extract text]';
-      }
+    // Extract text from file (PDF/DOC/DOCX/TXT/RTF)
+    resumeText = await extractResumeText(file);
+    if (!resumeText || !resumeText.trim()) {
+      return res.status(400).json({
+        error: 'Could not extract text from file',
+        message: 'Uploaded file could not be parsed into text. Please upload a PDF, DOC/DOCX, or TXT with readable text.'
+      });
     }
 
     // Use OpenAI if available, otherwise return placeholder
@@ -2147,34 +2177,14 @@ app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) 
     // Use OpenAI if available, otherwise return placeholder
     if (openai) {
       try {
-        // Convert file buffer to base64 for OpenAI
-        const base64File = req.file.buffer.toString('base64');
-        const fileExtension = path.extname(req.file.originalname).toLowerCase();
-        
-        // OpenAI supports PDF and text files
-        if (fileExtension === '.pdf' || fileExtension === '.txt') {
-          let resumeText = '';
-          
-          if (fileExtension === '.txt') {
-            resumeText = req.file.buffer.toString('utf-8');
-          } else {
-            if (pdfParse) {
-              try {
-                const parsed = await pdfParse(req.file.buffer);
-                resumeText = parsed.text || '';
-              } catch (pdfErr) {
-                return res.status(400).json({
-                  error: 'PDF parsing failed',
-                  message: pdfErr.message || 'Unable to extract text from PDF'
-                });
-              }
-            } else {
-              return res.status(400).json({
-                error: 'PDF parsing not enabled',
-                message: 'Install pdf-parse to extract text from PDF resumes (npm install pdf-parse)'
-              });
-            }
-          }
+        // Extract text from file (PDF/DOC/DOCX/TXT/RTF)
+        let resumeText = await extractResumeText(req.file);
+        if (!resumeText || !resumeText.trim()) {
+          return res.status(400).json({
+            error: 'Could not extract text from file',
+            message: 'Uploaded file could not be parsed into text. Please upload a PDF, DOC/DOCX, or TXT with readable text.'
+          });
+        }
 
           const completion = await openai.chat.completions.create({
             model: 'gpt-3.5-turbo',
@@ -2212,21 +2222,6 @@ app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) 
           }
 
           res.json({ parsed });
-        } else {
-          // For non-PDF/TXT files, return placeholder
-          res.json({
-            parsed: {
-              skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
-              contact: { name: null, email: null, phone: null, location: null },
-              summary: 'File format requires additional processing',
-              experience: [],
-              education: [],
-              certifications: [],
-              languages: [],
-              links: []
-            }
-          });
-        }
       } catch (aiError) {
         console.error('OpenAI API error:', aiError);
         // Fallback to placeholder
