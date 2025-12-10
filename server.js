@@ -48,8 +48,12 @@ const pool = new Pool({
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
-// AI Service API Key (using custom name instead of OPENAI_API_KEY)
-const AI_SERVICE_API_KEY = process.env.AI_SERVICE_API_KEY || process.env.JOBS_AI_API_KEY || null;
+// AI Service API Key (supports Vercel env names)
+const AI_SERVICE_API_KEY =
+  process.env.AI_SERVICE_API_KEY || // preferred (per Vercel)
+  process.env.OPENAI_API_KEY ||      // common default
+  process.env.JOBS_AI_API_KEY ||     // legacy fallback
+  null;
 
 // Initialize OpenAI client if API key is available
 let openai = null;
