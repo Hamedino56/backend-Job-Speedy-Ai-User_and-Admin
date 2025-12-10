@@ -431,7 +431,8 @@ app.get('/api/jobs', async (req, res) => {
     let query = `
       SELECT 
         j.*,
-        c.company,
+        COALESCE(j.company, c.company) AS company,
+        c.company AS client_company,
         j.location,
         j.job_type,
         j.category,
@@ -550,7 +551,8 @@ app.get('/api/jobs/:id', async (req, res) => {
     const result = await pool.query(
       `SELECT 
         j.*,
-        c.company,
+        COALESCE(j.company, c.company) AS company,
+        c.company AS client_company,
         j.location,
         j.job_type,
         j.category,
@@ -588,8 +590,9 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
       type, // alias from frontend
       category,
       language,
-      company, // possible alias for client_id (numeric)
-      company_id // possible alias for client_id
+      company, // possible alias for client_id (numeric) or company name
+      company_id, // possible alias for client_id
+      company_name, // explicit company name field
     } = req.body;
 
     if (!title || !department) {
@@ -610,10 +613,14 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
     }
 
     // Normalize optional types / defaults
+    const numericCompany =
+      company !== undefined && company !== null && company !== '' && !Number.isNaN(Number(company))
+        ? Number(company)
+        : undefined;
     const candidateClientId =
       client_id !== undefined ? client_id :
       company_id !== undefined ? company_id :
-      company;
+      numericCompany;
     const normalizedClientId =
       candidateClientId === undefined || candidateClientId === null || candidateClientId === ''
         ? null
@@ -621,6 +628,12 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
     const normalizedJobType = job_type || type || null;
     const normalizedStatus = status || 'Open';
     const normalizedCreatedBy = created_by || 'Admin';
+    const normalizedCompanyName =
+      company_name !== undefined && company_name !== null && company_name !== ''
+        ? company_name
+        : company !== undefined && typeof company === 'string' && company.trim() !== ''
+          ? company
+          : null;
 
     const availableCols = await getTableColumns('jobs');
     // Map payload fields to DB columns
@@ -636,6 +649,7 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
       job_type: normalizedJobType,
       category: category || null,
       language: language || null,
+      company: normalizedCompanyName,
     };
 
     const columns = [];
@@ -685,6 +699,7 @@ app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
       client_id,
       company,
       company_id,
+      company_name,
     } = req.body;
 
     // Normalize requirements to an array if provided
@@ -705,15 +720,25 @@ app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
     }
 
     // Normalize optional numeric / defaults
+    const numericCompany =
+      company !== undefined && company !== null && company !== '' && !Number.isNaN(Number(company))
+        ? Number(company)
+        : undefined;
     const candidateClientId =
       client_id !== undefined ? client_id :
       company_id !== undefined ? company_id :
-      company;
+      numericCompany;
     const normalizedClientId =
       candidateClientId === undefined || candidateClientId === null || candidateClientId === ''
         ? null
         : Number(candidateClientId);
     const normalizedJobType = job_type || type || null;
+    const normalizedCompanyName =
+      company_name !== undefined && company_name !== null && company_name !== ''
+        ? company_name
+        : company !== undefined && typeof company === 'string' && company.trim() !== ''
+          ? company
+          : null;
 
     const availableCols = await getTableColumns('jobs');
     const candidateFields = {
@@ -727,6 +752,7 @@ app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
       category,
       language,
       client_id: Number.isNaN(normalizedClientId) ? null : normalizedClientId,
+      company: normalizedCompanyName,
     };
 
     const updates = [];
@@ -906,7 +932,13 @@ app.get('/api/jobs/:id/xml-feed/:portal', async (req, res) => {
   try {
     const { id, portal } = req.params;
     const result = await pool.query(
-      `SELECT j.*, c.company FROM jobs j LEFT JOIN clients c ON j.client_id = c.id WHERE j.id = $1`,
+      `SELECT 
+        j.*,
+        COALESCE(j.company, c.company) AS company,
+        c.company AS client_company
+      FROM jobs j 
+      LEFT JOIN clients c ON j.client_id = c.id 
+      WHERE j.id = $1`,
       [id]
     );
 
