@@ -251,15 +251,36 @@ async function repairAiResponse(openaiClient, aiResponse, resumeText) {
 }
 
 function heuristicParsed(resumeText) {
+  const skillsHeuristic = extractSkillsHeuristic(resumeText);
   return normalizeParsed(
     {
-      skills: [],
+      skills: skillsHeuristic,
       contact: {},
       summary: 'Parsed resume text without AI (heuristic fallback)',
       experience: []
     },
     resumeText
   );
+}
+
+function extractSkillsHeuristic(resumeText = '') {
+  if (!resumeText) return [];
+  const candidates = resumeText
+    .split(/[\s,;\/\n]+/)
+    .map((w) => w.replace(/[^A-Za-z0-9\+\#\.\-]/g, ''))
+    .filter((w) => w.length > 1 && w.length < 40);
+  const commonStop = new Set(['and', 'or', 'the', 'a', 'an', 'to', 'in', 'of', 'for', 'on', 'with', 'at', 'by', 'from']);
+  const skills = [];
+  const seen = new Set();
+  for (const w of candidates) {
+    const key = w.toLowerCase();
+    if (commonStop.has(key)) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    skills.push(w);
+    if (skills.length >= 50) break;
+  }
+  return skills;
 }
 
 // Middleware: Verify JWT Token
@@ -2026,63 +2047,53 @@ app.post('/api/parse-resume', async (req, res) => {
       resumeText = req.body.text;
       fileExtension = path.extname(filename).toLowerCase();
       
-      // Process with OpenAI if available
-      if (openai) {
-        try {
-          const completion = await openai.chat.completions.create({
-            model: 'gpt-3.5-turbo',
-            messages: [
-              {
-                role: 'system',
-                content: 'You are a resume parser. Extract structured information from resumes. Return a JSON object with: skills (array), contact (object with name, email, phone, location), summary (string), experience (array of objects with title, company, start_date, end_date, responsibilities), education (array of objects with degree, institution, year), certifications (array), languages (array), and links (array).'
-              },
-              {
-                role: 'user',
-                content: `Parse this resume text:\n\n${resumeText}`
-              }
-            ],
-            temperature: 0.3,
-            max_tokens: 2000
-          });
-
-          const aiResponse = completion.choices[0]?.message?.content;
-          let parsed;
-          
-          try {
-            parsed = JSON.parse(aiResponse);
-          } catch (e) {
-            // Fallback to placeholder if JSON parsing fails
-            parsed = {
-              skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
-              contact: { name: null, email: null, phone: null, location: null },
-              summary: aiResponse || 'Resume parsed successfully',
-              experience: [],
-              education: [],
-              certifications: [],
-              languages: [],
-              links: []
-            };
-          }
-
-          return res.json({ parsed });
-        } catch (aiError) {
-          console.error('OpenAI API error:', aiError);
-          // Fallback to placeholder
-        }
+      if (!openai) {
+        return res.status(503).json({
+          error: 'AI not configured',
+          message: 'Set AI_SERVICE_API_KEY / OPENAI_API_KEY to enable resume parsing.'
+        });
       }
-      
-      // Return placeholder if OpenAI not available
-      const parsed = {
-        skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
-        contact: { name: null, email: null, phone: null, location: null },
-        summary: 'Resume parsed successfully',
-        experience: [],
-        education: [],
-        certifications: [],
-        languages: [],
-        links: []
-      };
-      return res.json({ parsed });
+
+      try {
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-3.5-turbo-1106',
+          response_format: { type: 'json_object' },
+          temperature: 0.2,
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You are a resume parser. Return ONLY JSON (no markdown, no prose). Schema: {skills:[string], contact:{name,email,phone,location}, summary:string, experience:[{title,company,start_date,end_date,responsibilities:[string]}], education:[{degree,institution,year}], certifications:[string], languages:[string], links:[string]}. Use the provided resume text; do not invent data.'
+            },
+            {
+              role: 'user',
+              content: `Parse this resume text and respond with JSON only (no extra text):\n\n${resumeText}`
+            }
+          ],
+          max_tokens: 2000
+        });
+
+        const aiResponse = completion.choices[0]?.message?.content || '';
+        let parsed = await parseAiResponseToJson(aiResponse, resumeText);
+        if (!parsed) {
+          parsed = await repairAiResponse(openai, aiResponse, resumeText);
+        }
+        if (!parsed) {
+          return res.status(500).json({
+            error: 'AI parse failed',
+            message: 'Unable to parse AI response into structured JSON',
+            ai_response_preview: aiResponse.slice(0, 500)
+          });
+        }
+
+        return res.json({ parsed });
+      } catch (aiError) {
+        console.error('OpenAI API error:', aiError);
+        return res.status(500).json({
+          error: 'AI parsing failed',
+          message: aiError.message || 'Error calling AI parser'
+        });
+      }
     }
 
     // Otherwise, handle file upload (multipart/form-data)
@@ -2275,86 +2286,63 @@ app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) 
       return res.status(400).json({ error: 'resume file is required' });
     }
 
-    // Use OpenAI if available, otherwise return placeholder
-    if (openai) {
-      try {
-        // Extract text from file (PDF/DOC/DOCX/TXT/RTF)
-        let resumeText = await extractResumeText(req.file);
-        if (!resumeText || !resumeText.trim()) {
-          return res.status(400).json({
-            error: 'Could not extract text from file',
-            message: 'Uploaded file could not be parsed into text. Please upload a PDF, DOC/DOCX, or TXT with readable text.'
-          });
-        }
+  // Require AI; no dummy placeholders
+  if (!openai) {
+    return res.status(503).json({
+      error: 'AI not configured',
+      message: 'Set AI_SERVICE_API_KEY / OPENAI_API_KEY to enable resume parsing.'
+    });
+  }
 
-        const completion = await openai.chat.completions.create({
-          model: 'gpt-3.5-turbo',
-          temperature: 0.2,
-          messages: [
-            {
-              role: 'system',
-              content:
-                'You are a resume parser. Return ONLY JSON (no markdown, no prose). Schema: {skills:[string], contact:{name,email,phone,location}, summary:string, experience:[{title,company,start_date,end_date,responsibilities:[string]}], education:[{degree,institution,year}], certifications:[string], languages:[string], links:[string]}.'
-            },
-            {
-              role: 'user',
-              content: `Parse this resume text and respond with JSON only:\n\n${resumeText}`
-            }
-          ],
-          max_tokens: 2000
-        });
-
-        const aiResponse = completion.choices[0]?.message?.content || '';
-        let parsed = await parseAiResponseToJson(aiResponse, resumeText);
-        if (!parsed) {
-          parsed = await repairAiResponse(openai, aiResponse, resumeText);
-        }
-        if (!parsed) {
-          parsed = heuristicParsed(resumeText);
-          parsed.summary = aiResponse || parsed.summary;
-        }
-
-        res.json({ parsed });
-      } catch (aiError) {
-        console.error('OpenAI API error:', aiError);
-        // Heuristic fallback
-        const parsed = heuristicParsed(await extractResumeText(req.file));
-        parsed.summary = 'Error parsing resume with AI. Using heuristic data.';
-        res.json({ parsed });
-      }
-    } else {
-      // Placeholder response when OpenAI is not configured
-      const parsed = {
-        skills: ['JavaScript', 'React', 'Node.js', 'PostgreSQL'],
-        contact: {
-          name: null,
-          email: null,
-          phone: null,
-          location: null
-        },
-        summary: 'Experienced developer with strong technical skills',
-        experience: [
-          {
-            title: 'Senior Developer',
-            company: 'Tech Company',
-            start_date: '2020-01-01',
-            end_date: '2023-12-31',
-            responsibilities: ['Developed web applications', 'Led team projects']
-          }
-        ],
-        education: [
-          {
-            degree: 'Bachelor of Science',
-            institution: 'University',
-            year: '2018'
-          }
-        ],
-        certifications: ['AWS Certified'],
-        languages: ['English'],
-        links: []
-      };
-      res.json({ parsed });
+  try {
+    // Extract text from file (PDF/DOC/DOCX/TXT/RTF)
+    let resumeText = await extractResumeText(req.file);
+    if (!resumeText || !resumeText.trim()) {
+      return res.status(400).json({
+        error: 'Could not extract text from file',
+        message: 'Uploaded file could not be parsed into text. Please upload a PDF, DOC/DOCX, or TXT with readable text.'
+      });
     }
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo-1106',
+      response_format: { type: 'json_object' },
+      temperature: 0.2,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a resume parser. Return ONLY JSON (no markdown, no prose). Schema: {skills:[string], contact:{name,email,phone,location}, summary:string, experience:[{title,company,start_date,end_date,responsibilities:[string]}], education:[{degree,institution,year}], certifications:[string], languages:[string], links:[string]}. Use the provided resume text; do not invent data.'
+        },
+        {
+          role: 'user',
+          content: `Parse this resume text and respond with JSON only (no extra text):\n\n${resumeText}`
+        }
+      ],
+      max_tokens: 2000
+    });
+
+    const aiResponse = completion.choices[0]?.message?.content || '';
+    let parsed = await parseAiResponseToJson(aiResponse, resumeText);
+    if (!parsed) {
+      parsed = await repairAiResponse(openai, aiResponse, resumeText);
+    }
+    if (!parsed) {
+      return res.status(500).json({
+        error: 'AI parse failed',
+        message: 'Unable to parse AI response into structured JSON',
+        ai_response_preview: aiResponse.slice(0, 500)
+      });
+    }
+
+    res.json({ parsed });
+  } catch (aiError) {
+    console.error('OpenAI API error:', aiError);
+    return res.status(500).json({
+      error: 'AI parsing failed',
+      message: aiError.message || 'Error calling AI parser'
+    });
+  }
   } catch (error) {
     console.error('Extract skills error:', error);
     res.status(500).json({ error: 'Internal server error' });
