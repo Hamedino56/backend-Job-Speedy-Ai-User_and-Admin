@@ -283,6 +283,73 @@ function extractSkillsHeuristic(resumeText = '') {
   return skills;
 }
 
+// Centralized AI parsing for resumes (no dummy data)
+async function aiParseResume(openaiClient, resumeText) {
+  const truncatedText = resumeText.slice(0, 15000);
+
+  const baseMessages = [
+    {
+      role: 'system',
+      content:
+        'You are a resume parser. Return ONLY JSON (no markdown, no prose). Schema: {skills:[string], contact:{name,email,phone,location}, summary:string, experience:[{title,company,start_date,end_date,responsibilities:[string]}], education:[{degree,institution,year}], certifications:[string], languages:[string], links:[string]}. Use ONLY the provided resume text; do not invent data.'
+    },
+    {
+      role: 'user',
+      content: `Parse this resume text and respond with JSON only (no extra text):\n\n${truncatedText}`
+    }
+  ];
+
+  const strictCall = async (messages) => {
+    const completion = await openaiClient.chat.completions.create({
+      model: 'gpt-3.5-turbo-1106',
+      response_format: { type: 'json_object' },
+      temperature: 0.1,
+      messages,
+      max_tokens: 2000
+    });
+    return completion.choices[0]?.message?.content || '';
+  };
+
+  // First attempt
+  let aiResponse = await strictCall(baseMessages);
+  let parsed = await parseAiResponseToJson(aiResponse, truncatedText);
+  if (!parsed) {
+    parsed = await repairAiResponse(openaiClient, aiResponse, truncatedText);
+  }
+
+  // If parsed but missing core data, attempt a focused re-ask
+  const needsRetry =
+    !parsed ||
+    ((parsed.skills.length === 0 || parsed.skills.every((s) => !s.trim())) &&
+      parsed.experience.length === 0 &&
+      (!parsed.contact.name && !parsed.contact.email && !parsed.contact.phone));
+
+  if (needsRetry) {
+    const retryMessages = [
+      {
+        role: 'system',
+        content:
+          'You are a resume parser. Return ONLY JSON (no markdown). Extract actual data from the resume text; do not invent. Schema: {skills:[string], contact:{name,email,phone,location}, summary:string, experience:[{title,company,start_date,end_date,responsibilities:[string]}], education:[{degree,institution,year}], certifications:[string], languages:[string], links:[string]}. Ensure skills and experience are filled when present in text.'
+      },
+      {
+        role: 'user',
+        content: `Parse this resume text and respond with JSON only (no extra text):\n\n${truncatedText}`
+      }
+    ];
+    aiResponse = await strictCall(retryMessages);
+    parsed = await parseAiResponseToJson(aiResponse, truncatedText);
+    if (!parsed) {
+      parsed = await repairAiResponse(openaiClient, aiResponse, truncatedText);
+    }
+  }
+
+  if (!parsed) {
+    throw new Error('AI parse failed');
+  }
+
+  return parsed;
+}
+
 // Middleware: Verify JWT Token
 const verifyToken = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
