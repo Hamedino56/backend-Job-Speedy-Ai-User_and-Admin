@@ -599,7 +599,7 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
       return res.status(400).json({ error: 'title and department are required' });
     }
 
-    // Normalize requirements to an array (accept array, JSON string, or plain string -> single-item array)
+    // Normalize requirements to an array (accept array, JSON string, or string -> split by comma/line)
     let requirementsArray = [];
     if (Array.isArray(requirements)) {
       requirementsArray = requirements;
@@ -608,7 +608,34 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
         const parsed = JSON.parse(requirements);
         requirementsArray = Array.isArray(parsed) ? parsed : [];
       } catch {
-        requirementsArray = requirements.trim() ? [requirements] : [];
+        requirementsArray = requirements
+          .split(/,|\n/)
+          .map((item) => item.trim())
+          .filter(Boolean);
+      }
+    }
+
+    // Normalize required skills (accept aliases and string/array)
+    const requiredSkillsRaw =
+      req.body.required_skills ??
+      req.body.requiredSkills ??
+      req.body.skills ??
+      req.body.skills_text ??
+      req.body.skillsText;
+    let requiredSkillsArray = [];
+    if (requiredSkillsRaw !== undefined) {
+      if (Array.isArray(requiredSkillsRaw)) {
+        requiredSkillsArray = requiredSkillsRaw;
+      } else if (typeof requiredSkillsRaw === 'string') {
+        try {
+          const parsed = JSON.parse(requiredSkillsRaw);
+          requiredSkillsArray = Array.isArray(parsed) ? parsed : [];
+        } catch {
+          requiredSkillsArray = requiredSkillsRaw
+            .split(/,|\n/)
+            .map((item) => item.trim())
+            .filter(Boolean);
+        }
       }
     }
 
@@ -641,6 +668,7 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
       title,
       department,
       description: description || null,
+      required_skills: requiredSkillsArray,
       requirements: requirementsArray,
       status: normalizedStatus,
       created_by: normalizedCreatedBy,
@@ -690,6 +718,7 @@ app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
       department,
       description,
       requirements,
+      required_skills,
       status,
       location,
       job_type,
@@ -712,10 +741,39 @@ app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
           const parsed = JSON.parse(requirements);
           requirementsArray = Array.isArray(parsed) ? parsed : [];
         } catch {
-          requirementsArray = requirements.trim() ? [requirements] : [];
+          requirementsArray = requirements
+            .split(/,|\n/)
+            .map((item) => item.trim())
+            .filter(Boolean);
         }
       } else {
         requirementsArray = [];
+      }
+    }
+
+    // Normalize required skills (accept aliases and string/array)
+    const requiredSkillsRaw =
+      required_skills ??
+      req.body.requiredSkills ??
+      req.body.skills ??
+      req.body.skills_text ??
+      req.body.skillsText;
+    let requiredSkillsArray = undefined;
+    if (requiredSkillsRaw !== undefined) {
+      if (Array.isArray(requiredSkillsRaw)) {
+        requiredSkillsArray = requiredSkillsRaw;
+      } else if (typeof requiredSkillsRaw === 'string') {
+        try {
+          const parsed = JSON.parse(requiredSkillsRaw);
+          requiredSkillsArray = Array.isArray(parsed) ? parsed : [];
+        } catch {
+          requiredSkillsArray = requiredSkillsRaw
+            .split(/,|\n/)
+            .map((item) => item.trim())
+            .filter(Boolean);
+        }
+      } else {
+        requiredSkillsArray = [];
       }
     }
 
@@ -745,6 +803,7 @@ app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
       title,
       department,
       description,
+      required_skills: requiredSkillsArray,
       requirements: requirementsArray,
       status,
       location,
