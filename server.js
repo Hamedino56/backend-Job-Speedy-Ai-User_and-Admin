@@ -6,6 +6,12 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
+let pdfParse = null;
+try {
+  pdfParse = require('pdf-parse');
+} catch (e) {
+  console.log('pdf-parse not installed; PDF resume parsing will use fallbacks until installed.');
+}
 
 // OpenAI integration (optional - only if API key is provided)
 let OpenAI;
@@ -1982,9 +1988,22 @@ app.post('/api/parse-resume', async (req, res) => {
     if (fileExtension === '.txt') {
       resumeText = file.buffer.toString('utf-8');
     } else if (fileExtension === '.pdf') {
-      // For PDF, we'll use OpenAI's vision API or text extraction
-      // Note: For better PDF parsing, consider using pdf-parse library
-      resumeText = '[PDF file - text extraction needed]';
+      if (pdfParse) {
+        try {
+          const parsed = await pdfParse(file.buffer);
+          resumeText = parsed.text || '';
+        } catch (pdfErr) {
+          return res.status(400).json({
+            error: 'PDF parsing failed',
+            message: pdfErr.message || 'Unable to extract text from PDF'
+          });
+        }
+      } else {
+        return res.status(400).json({
+          error: 'PDF parsing not enabled',
+          message: 'Install pdf-parse to extract text from PDF resumes (npm install pdf-parse)'
+        });
+      }
     } else {
       // Try to read as text for other formats
       try {
@@ -2007,9 +2026,7 @@ app.post('/api/parse-resume', async (req, res) => {
             },
             {
               role: 'user',
-              content: fileExtension === '.txt' || resumeText !== '[PDF file - text extraction needed]'
-                ? `Parse this resume text:\n\n${resumeText}`
-                : 'Please extract information from this resume. Note: PDF parsing requires additional setup.'
+              content: `Parse this resume text:\n\n${resumeText}`
             }
           ],
           temperature: 0.3,
@@ -2132,16 +2149,27 @@ app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) 
         
         // OpenAI supports PDF and text files
         if (fileExtension === '.pdf' || fileExtension === '.txt') {
-          // For PDF files, we need to use the file upload API or text extraction
-          // For simplicity, we'll extract text from the buffer if possible
           let resumeText = '';
           
           if (fileExtension === '.txt') {
             resumeText = req.file.buffer.toString('utf-8');
           } else {
-            // For PDF, we'd need a PDF parser library
-            // For now, use OpenAI with text extraction prompt
-            resumeText = '[PDF file content - text extraction needed]';
+            if (pdfParse) {
+              try {
+                const parsed = await pdfParse(req.file.buffer);
+                resumeText = parsed.text || '';
+              } catch (pdfErr) {
+                return res.status(400).json({
+                  error: 'PDF parsing failed',
+                  message: pdfErr.message || 'Unable to extract text from PDF'
+                });
+              }
+            } else {
+              return res.status(400).json({
+                error: 'PDF parsing not enabled',
+                message: 'Install pdf-parse to extract text from PDF resumes (npm install pdf-parse)'
+              });
+            }
           }
 
           const completion = await openai.chat.completions.create({
@@ -2153,9 +2181,7 @@ app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) 
               },
               {
                 role: 'user',
-                content: fileExtension === '.txt' 
-                  ? `Parse this resume text:\n\n${resumeText}`
-                  : 'Please extract information from this resume. Note: PDF parsing requires additional setup.'
+                content: `Parse this resume text:\n\n${resumeText}`
               }
             ],
             temperature: 0.3,
