@@ -118,6 +118,22 @@ const verifyAdmin = async (req, res, next) => {
   }
 };
 
+// --------------------------------------------
+// Helper: cache table columns to handle older schemas gracefully
+// --------------------------------------------
+const tableColumnsCache = {};
+
+const getTableColumns = async (tableName) => {
+  if (tableColumnsCache[tableName]) return tableColumnsCache[tableName];
+  const result = await pool.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_name = $1`,
+    [tableName]
+  );
+  const cols = result.rows.map((r) => r.column_name);
+  tableColumnsCache[tableName] = cols;
+  return cols;
+};
+
 // ============================================
 // AUTHENTICATION APIs
 // ============================================
@@ -559,35 +575,85 @@ app.get('/api/jobs/:id', async (req, res) => {
 // Create Job (Admin Only)
 app.post('/api/jobs', verifyAdmin, async (req, res) => {
   try {
-    const { title, department, description, requirements, status, created_by, client_id, location, job_type, category, language } = req.body;
+    const {
+      title,
+      department,
+      description,
+      requirements,
+      status,
+      created_by,
+      client_id,
+      location,
+      job_type,
+      category,
+      language,
+    } = req.body;
 
     if (!title || !department) {
       return res.status(400).json({ error: 'title and department are required' });
     }
 
-    const result = await pool.query(
-      `INSERT INTO jobs (title, department, description, requirements, status, created_by, client_id, location, job_type, category, language)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-       RETURNING *`,
-      [
-        title,
-        department,
-        description || null,
-        requirements || [],
-        status || 'Open',
-        created_by || 'Admin',
-        client_id || null,
-        location || null,
-        job_type || null,
-        category || null,
-        language || null
-      ]
-    );
+    // Normalize requirements to an array (accept array or JSON string)
+    let requirementsArray = [];
+    if (Array.isArray(requirements)) {
+      requirementsArray = requirements;
+    } else if (typeof requirements === 'string') {
+      try {
+        const parsed = JSON.parse(requirements);
+        requirementsArray = Array.isArray(parsed) ? parsed : [];
+      } catch {
+        requirementsArray = [];
+      }
+    }
+
+    // Normalize optional types / defaults
+    const normalizedClientId =
+      client_id === undefined || client_id === null || client_id === '' ? null : Number(client_id);
+    const normalizedStatus = status || 'Open';
+    const normalizedCreatedBy = created_by || 'Admin';
+
+    const availableCols = await getTableColumns('jobs');
+    // Map payload fields to DB columns
+    const candidateFields = {
+      title,
+      department,
+      description: description || null,
+      requirements: requirementsArray,
+      status: normalizedStatus,
+      created_by: normalizedCreatedBy,
+      client_id: Number.isNaN(normalizedClientId) ? null : normalizedClientId,
+      location: location || null,
+      job_type: job_type || null,
+      category: category || null,
+      language: language || null,
+    };
+
+    const columns = [];
+    const values = [];
+    let param = 0;
+    for (const [key, value] of Object.entries(candidateFields)) {
+      if (availableCols.includes(key) && value !== undefined) {
+        param += 1;
+        columns.push(key);
+        values.push(value);
+      }
+    }
+
+    if (columns.length === 0) {
+      return res.status(400).json({
+        error: 'No matching columns found in jobs table',
+        available_columns: availableCols
+      });
+    }
+
+    const placeholders = columns.map((_, idx) => `$${idx + 1}`).join(', ');
+    const query = `INSERT INTO jobs (${columns.join(', ')}) VALUES (${placeholders}) RETURNING *`;
+    const result = await pool.query(query, values);
 
     res.status(201).json({ job: result.rows[0] });
   } catch (error) {
     console.error('Create job error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
@@ -595,69 +661,72 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
 app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, department, description, requirements, status, location, job_type, category, language } = req.body;
+    const {
+      title,
+      department,
+      description,
+      requirements,
+      status,
+      location,
+      job_type,
+      category,
+      language,
+      client_id,
+    } = req.body;
+
+    // Normalize requirements to an array if provided
+    let requirementsArray = undefined;
+    if (requirements !== undefined) {
+      if (Array.isArray(requirements)) {
+        requirementsArray = requirements;
+      } else if (typeof requirements === 'string') {
+        try {
+          const parsed = JSON.parse(requirements);
+          requirementsArray = Array.isArray(parsed) ? parsed : [];
+        } catch {
+          requirementsArray = [];
+        }
+      } else {
+        requirementsArray = [];
+      }
+    }
+
+    const availableCols = await getTableColumns('jobs');
+    const candidateFields = {
+      title,
+      department,
+      description,
+      requirements: requirementsArray,
+      status,
+      location,
+      job_type,
+      category,
+      language,
+      client_id,
+    };
 
     const updates = [];
     const values = [];
-    let paramCount = 0;
+    let param = 0;
 
-    if (title !== undefined) {
-      paramCount++;
-      updates.push(`title = $${paramCount}`);
-      values.push(title);
-    }
-    if (department !== undefined) {
-      paramCount++;
-      updates.push(`department = $${paramCount}`);
-      values.push(department);
-    }
-    if (description !== undefined) {
-      paramCount++;
-      updates.push(`description = $${paramCount}`);
-      values.push(description);
-    }
-    if (requirements !== undefined) {
-      paramCount++;
-      updates.push(`requirements = $${paramCount}`);
-      values.push(requirements);
-    }
-    if (status !== undefined) {
-      paramCount++;
-      updates.push(`status = $${paramCount}`);
-      values.push(status);
-    }
-    if (location !== undefined) {
-      paramCount++;
-      updates.push(`location = $${paramCount}`);
-      values.push(location);
-    }
-    if (job_type !== undefined) {
-      paramCount++;
-      updates.push(`job_type = $${paramCount}`);
-      values.push(job_type);
-    }
-    if (category !== undefined) {
-      paramCount++;
-      updates.push(`category = $${paramCount}`);
-      values.push(category);
-    }
-    if (language !== undefined) {
-      paramCount++;
-      updates.push(`language = $${paramCount}`);
-      values.push(language);
+    for (const [key, value] of Object.entries(candidateFields)) {
+      if (value !== undefined && availableCols.includes(key)) {
+        param += 1;
+        updates.push(`${key} = $${param}`);
+        values.push(value);
+      }
     }
 
     if (updates.length === 0) {
       return res.status(400).json({ error: 'No fields to update' });
     }
 
-    paramCount++;
     updates.push(`updated_at = NOW()`);
-    paramCount++;
+    param += 1;
     values.push(id);
 
     const result = await pool.query(
-      `UPDATE jobs SET ${updates.join(', ')} WHERE id = $${paramCount} RETURNING *`,
+      `UPDATE jobs SET ${updates.join(', ')} WHERE id = $${param} RETURNING *`,
       values
     );
 
@@ -1284,8 +1353,130 @@ app.delete('/api/clients/:id', verifyAdmin, async (req, res) => {
 // ============================================
 
 // Create/Parse Applicant Resume
-app.post('/api/applicants', upload.single('resume'), async (req, res) => {
+// Supports both file upload and JSON payload with parsed data
+app.post('/api/applicants', async (req, res) => {
   try {
+    let resumeFile = null;
+    let resumeFilename = null;
+    let resumeMime = null;
+    let resumeData = null;
+
+    // Check if request is JSON with parsed data (from /api/parse-resume)
+    if (req.body && req.body.parsed && req.body.name && req.body.email) {
+      // Handle JSON payload with parsed resume data
+      const { name, email, phone, parsed } = req.body;
+      
+      // Extract data from parsed object
+      const skillsArray = parsed.skills || [];
+      const experienceArray = parsed.experience || [];
+      const education = parsed.education?.[0] ? 
+        `${parsed.education[0].degree || ''} ${parsed.education[0].institution || ''} ${parsed.education[0].year || ''}`.trim() :
+        (parsed.education || null);
+      
+      // Generate classification using OpenAI if available
+      let applicantClassification = {
+        stack: 'Full Stack',
+        percentage: 85,
+        role: 'Senior Developer',
+        reasoning: 'Based on skills and experience analysis'
+      };
+
+      if (openai && (skillsArray.length > 0 || experienceArray.length > 0)) {
+        try {
+          const skillsText = skillsArray.join(', ');
+          const experienceText = experienceArray.map(exp => 
+            `${exp.title || exp.role || 'Role'} at ${exp.company || 'Company'}`
+          ).join(', ');
+
+          const completion = await openai.chat.completions.create({
+            model: 'gpt-3.5-turbo',
+            messages: [
+              {
+                role: 'system',
+                content: 'You are a technical recruiter. Analyze the candidate\'s skills and experience, then classify them. Return a JSON object with: stack (e.g., "Full Stack", "Frontend", "Backend"), percentage (0-100 confidence score), role (e.g., "Senior Developer", "Junior Developer"), and reasoning (brief explanation).'
+              },
+              {
+                role: 'user',
+                content: `Skills: ${skillsText}\nExperience: ${experienceText}\n\nClassify this candidate.`
+              }
+            ],
+            temperature: 0.5,
+            max_tokens: 300
+          });
+
+          const aiResponse = completion.choices[0]?.message?.content;
+          try {
+            const aiClassification = JSON.parse(aiResponse);
+            applicantClassification = {
+              stack: aiClassification.stack || applicantClassification.stack,
+              percentage: aiClassification.percentage || applicantClassification.percentage,
+              role: aiClassification.role || applicantClassification.role,
+              reasoning: aiClassification.reasoning || applicantClassification.reasoning
+            };
+          } catch (e) {
+            console.log('Could not parse AI classification, using default');
+          }
+        } catch (aiError) {
+          console.error('OpenAI classification error:', aiError);
+        }
+      }
+
+      const result = await pool.query(
+        `INSERT INTO applicants (name, email, phone, skills, experience, education, resume_filename, resume_mime, resume_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id, name, email, phone, skills, experience, education, created_at`,
+        [
+          name,
+          email,
+          phone || null,
+          skillsArray,
+          JSON.stringify(experienceArray),
+          education,
+          parsed.contact?.name ? `${parsed.contact.name}_resume.pdf` : 'resume.pdf',
+          'application/pdf',
+          null // No file data when using JSON payload
+        ]
+      );
+
+      const applicant = result.rows[0];
+      applicant.classification = applicantClassification;
+
+      return res.status(201).json({ applicant });
+    }
+
+    // Otherwise, handle file upload (multipart/form-data)
+    const uploadMiddleware = upload.single('resume');
+    
+    await new Promise((resolve, reject) => {
+      uploadMiddleware(req, res, (err) => {
+        if (err) {
+          if (err instanceof multer.MulterError) {
+            if (err.code === 'LIMIT_FILE_SIZE') {
+              return res.status(400).json({ 
+                error: 'File too large',
+                message: 'File size exceeds 10MB limit'
+              });
+            }
+            return res.status(400).json({ 
+              error: 'File upload error',
+              message: err.message
+            });
+          }
+          if (err.message && err.message.includes('Invalid file type')) {
+            return res.status(400).json({ 
+              error: 'Invalid file type',
+              message: err.message
+            });
+          }
+          return res.status(400).json({ 
+            error: 'File upload error',
+            message: err.message || 'Failed to process file upload'
+          });
+        }
+        resolve();
+      });
+    });
+
     const { name, email, phone, skills, experience, education } = req.body;
 
     if (!name || !email) {
@@ -1295,6 +1486,11 @@ app.post('/api/applicants', upload.single('resume'), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: 'resume file is required' });
     }
+
+    resumeFile = req.file;
+    resumeFilename = resumeFile.originalname;
+    resumeMime = resumeFile.mimetype;
+    resumeData = resumeFile.buffer;
 
     let skillsArray = [];
     if (skills) {
@@ -1315,6 +1511,54 @@ app.post('/api/applicants', upload.single('resume'), async (req, res) => {
     }
 
     // Generate classification using OpenAI if available
+    let fileUploadClassification = {
+      stack: 'Full Stack',
+      percentage: 85,
+      role: 'Senior Developer',
+      reasoning: 'Based on skills and experience analysis'
+    };
+
+    if (openai && (skillsArray.length > 0 || experienceArray.length > 0)) {
+      try {
+        const skillsText = skillsArray.join(', ');
+        const experienceText = experienceArray.map(exp => 
+          `${exp.role || exp.title || 'Role'} at ${exp.company || 'Company'}`
+        ).join(', ');
+
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-3.5-turbo',
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a technical recruiter. Analyze the candidate\'s skills and experience, then classify them. Return a JSON object with: stack (e.g., "Full Stack", "Frontend", "Backend"), percentage (0-100 confidence score), role (e.g., "Senior Developer", "Junior Developer"), and reasoning (brief explanation).'
+            },
+            {
+              role: 'user',
+              content: `Skills: ${skillsText}\nExperience: ${experienceText}\n\nClassify this candidate.`
+            }
+          ],
+          temperature: 0.5,
+          max_tokens: 300
+        });
+
+        const aiResponse = completion.choices[0]?.message?.content;
+        try {
+          const aiClassification = JSON.parse(aiResponse);
+          fileUploadClassification = {
+            stack: aiClassification.stack || fileUploadClassification.stack,
+            percentage: aiClassification.percentage || fileUploadClassification.percentage,
+            role: aiClassification.role || fileUploadClassification.role,
+            reasoning: aiClassification.reasoning || fileUploadClassification.reasoning
+          };
+        } catch (e) {
+          console.log('Could not parse AI classification, using default');
+        }
+      } catch (aiError) {
+        console.error('OpenAI classification error:', aiError);
+      }
+    }
+
+    // Generate classification using OpenAI if available
     let classification = {
       stack: 'Full Stack',
       percentage: 85,
@@ -1326,7 +1570,7 @@ app.post('/api/applicants', upload.single('resume'), async (req, res) => {
       try {
         const skillsText = skillsArray.join(', ');
         const experienceText = experienceArray.map(exp => 
-          `${exp.role || 'Role'} at ${exp.company || 'Company'}`
+          `${exp.role || exp.title || 'Role'} at ${exp.company || 'Company'}`
         ).join(', ');
 
         const completion = await openai.chat.completions.create({
@@ -1355,12 +1599,10 @@ app.post('/api/applicants', upload.single('resume'), async (req, res) => {
             reasoning: aiClassification.reasoning || classification.reasoning
           };
         } catch (e) {
-          // If JSON parsing fails, use default
           console.log('Could not parse AI classification, using default');
         }
       } catch (aiError) {
         console.error('OpenAI classification error:', aiError);
-        // Use default classification
       }
     }
 
@@ -1375,14 +1617,14 @@ app.post('/api/applicants', upload.single('resume'), async (req, res) => {
         skillsArray,
         JSON.stringify(experienceArray),
         education || null,
-        req.file.originalname,
-        req.file.mimetype,
-        req.file.buffer
+        resumeFilename,
+        resumeMime,
+        resumeData
       ]
     );
 
     const applicant = result.rows[0];
-    applicant.classification = classification;
+    applicant.classification = fileUploadClassification;
 
     res.status(201).json({ applicant });
   } catch (error) {
