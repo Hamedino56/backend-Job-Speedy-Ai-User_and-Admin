@@ -10,6 +10,7 @@ const { v4: uuidv4 } = require('uuid');
 // Document parsers (PDF, DOC/DOCX)
 let pdfjsLib = null;
 let mammoth = null;
+let pdfParse = null;
 try {
   pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
 } catch (e) {
@@ -19,6 +20,11 @@ try {
   mammoth = require('mammoth');
 } catch (e) {
   console.log('mammoth not installed; DOC/DOCX parsing will use fallback.');
+}
+try {
+  pdfParse = require('pdf-parse');
+} catch (e) {
+  console.log('pdf-parse not installed; PDF parsing will rely on pdfjs-dist.');
 }
 
 // OpenAI integration (optional - only if API key is provided)
@@ -120,6 +126,16 @@ async function extractResumeText(file) {
       if (text.trim()) return text;
     } catch (e) {
       console.error('PDF parse error (pdfjs):', e.message);
+    }
+  }
+
+  // PDF fallback via pdf-parse if available
+  if (ext === '.pdf' && pdfParse) {
+    try {
+      const parsed = await pdfParse(file.buffer);
+      if (parsed.text && parsed.text.trim()) return parsed.text;
+    } catch (e) {
+      console.error('PDF parse error (pdf-parse):', e.message);
     }
   }
 
