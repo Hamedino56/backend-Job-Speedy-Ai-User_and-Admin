@@ -109,7 +109,7 @@ const upload = multer({
 });
 
 // Helper: extract text from uploaded resume (PDF, DOC/DOCX, TXT)
-async function extractResumeText(file) {
+async function extractResumeText(file, maxChars = 60000) {
   const ext = (path.extname(file?.originalname || '') || '').toLowerCase();
 
   // PDF via pdfjs-dist if available
@@ -123,7 +123,7 @@ async function extractResumeText(file) {
         const content = await page.getTextContent();
         text += content.items.map((item) => item.str).join(' ') + '\n';
       }
-      if (text.trim()) return text;
+      if (text.trim()) return text.slice(0, maxChars);
     } catch (e) {
       console.error('PDF parse error (pdfjs):', e.message);
     }
@@ -133,7 +133,7 @@ async function extractResumeText(file) {
   if (ext === '.pdf' && pdfParse) {
     try {
       const parsed = await pdfParse(file.buffer);
-      if (parsed.text && parsed.text.trim()) return parsed.text;
+      if (parsed.text && parsed.text.trim()) return parsed.text.slice(0, maxChars);
     } catch (e) {
       console.error('PDF parse error (pdf-parse):', e.message);
     }
@@ -152,7 +152,7 @@ async function extractResumeText(file) {
   // Plain text / RTF / fallback decode
   try {
     const text = file.buffer.toString('utf-8');
-    if (text.trim()) return text;
+    if (text.trim()) return text.slice(0, maxChars);
   } catch (e) {
     console.error('Fallback text decode error:', e.message);
   }
@@ -2055,7 +2055,10 @@ app.post('/api/parse-resume', async (req, res) => {
       }
 
       try {
-        const completion = await openai.chat.completions.create({
+      // Truncate resume text to avoid model context overflow
+      const truncatedText = resumeText.slice(0, 15000);
+
+      const completion = await openai.chat.completions.create({
           model: 'gpt-3.5-turbo-1106',
           response_format: { type: 'json_object' },
           temperature: 0.2,
@@ -2067,7 +2070,7 @@ app.post('/api/parse-resume', async (req, res) => {
             },
             {
               role: 'user',
-              content: `Parse this resume text and respond with JSON only (no extra text):\n\n${resumeText}`
+            content: `Parse this resume text and respond with JSON only (no extra text):\n\n${truncatedText}`
             }
           ],
           max_tokens: 2000
@@ -2304,6 +2307,9 @@ app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) 
       });
     }
 
+    // Truncate resume text to avoid model context overflow
+    const truncatedText = resumeText.slice(0, 15000);
+
     const completion = await openai.chat.completions.create({
       model: 'gpt-3.5-turbo-1106',
       response_format: { type: 'json_object' },
@@ -2316,7 +2322,7 @@ app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) 
         },
         {
           role: 'user',
-          content: `Parse this resume text and respond with JSON only (no extra text):\n\n${resumeText}`
+          content: `Parse this resume text and respond with JSON only (no extra text):\n\n${truncatedText}`
         }
       ],
       max_tokens: 2000
