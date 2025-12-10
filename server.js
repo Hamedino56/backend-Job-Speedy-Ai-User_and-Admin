@@ -585,15 +585,18 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
       client_id,
       location,
       job_type,
+      type, // alias from frontend
       category,
       language,
+      company, // possible alias for client_id (numeric)
+      company_id // possible alias for client_id
     } = req.body;
 
     if (!title || !department) {
       return res.status(400).json({ error: 'title and department are required' });
     }
 
-    // Normalize requirements to an array (accept array or JSON string)
+    // Normalize requirements to an array (accept array, JSON string, or plain string -> single-item array)
     let requirementsArray = [];
     if (Array.isArray(requirements)) {
       requirementsArray = requirements;
@@ -602,13 +605,20 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
         const parsed = JSON.parse(requirements);
         requirementsArray = Array.isArray(parsed) ? parsed : [];
       } catch {
-        requirementsArray = [];
+        requirementsArray = requirements.trim() ? [requirements] : [];
       }
     }
 
     // Normalize optional types / defaults
+    const candidateClientId =
+      client_id !== undefined ? client_id :
+      company_id !== undefined ? company_id :
+      company;
     const normalizedClientId =
-      client_id === undefined || client_id === null || client_id === '' ? null : Number(client_id);
+      candidateClientId === undefined || candidateClientId === null || candidateClientId === ''
+        ? null
+        : Number(candidateClientId);
+    const normalizedJobType = job_type || type || null;
     const normalizedStatus = status || 'Open';
     const normalizedCreatedBy = created_by || 'Admin';
 
@@ -623,7 +633,7 @@ app.post('/api/jobs', verifyAdmin, async (req, res) => {
       created_by: normalizedCreatedBy,
       client_id: Number.isNaN(normalizedClientId) ? null : normalizedClientId,
       location: location || null,
-      job_type: job_type || null,
+      job_type: normalizedJobType,
       category: category || null,
       language: language || null,
     };
@@ -669,9 +679,12 @@ app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
       status,
       location,
       job_type,
+      type, // alias from frontend
       category,
       language,
       client_id,
+      company,
+      company_id,
     } = req.body;
 
     // Normalize requirements to an array if provided
@@ -684,12 +697,23 @@ app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
           const parsed = JSON.parse(requirements);
           requirementsArray = Array.isArray(parsed) ? parsed : [];
         } catch {
-          requirementsArray = [];
+          requirementsArray = requirements.trim() ? [requirements] : [];
         }
       } else {
         requirementsArray = [];
       }
     }
+
+    // Normalize optional numeric / defaults
+    const candidateClientId =
+      client_id !== undefined ? client_id :
+      company_id !== undefined ? company_id :
+      company;
+    const normalizedClientId =
+      candidateClientId === undefined || candidateClientId === null || candidateClientId === ''
+        ? null
+        : Number(candidateClientId);
+    const normalizedJobType = job_type || type || null;
 
     const availableCols = await getTableColumns('jobs');
     const candidateFields = {
@@ -699,10 +723,10 @@ app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
       requirements: requirementsArray,
       status,
       location,
-      job_type,
+      job_type: normalizedJobType,
       category,
       language,
-      client_id,
+      client_id: Number.isNaN(normalizedClientId) ? null : normalizedClientId,
     };
 
     const updates = [];
@@ -737,7 +761,7 @@ app.put('/api/jobs/:id', verifyAdmin, async (req, res) => {
     res.json({ job: result.rows[0] });
   } catch (error) {
     console.error('Update job error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
