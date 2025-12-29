@@ -2,7 +2,7 @@
 
 ## 📊 Database Schema
 
-### 1. `admin_users` Table
+### 1. `admin_users` Tables
 **Purpose:** Stores admin user accounts
 
 ```sql
