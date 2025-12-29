@@ -1558,7 +1558,8 @@ app.delete('/api/users/:id', verifyAdmin, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    res.json({ message: 'User deleted successfully', id: parseInt(id) });
+    // Frontend expects at least { success: true } on successful delete
+    res.json({ success: true, message: 'User deleted successfully', id: parseInt(id) });
   } catch (error) {
     console.error('Delete user error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -1632,7 +1633,16 @@ app.get('/api/clients', verifyAdmin, async (req, res) => {
       ORDER BY c.created_at DESC`
     );
 
-    res.json({ clients: result.rows });
+    // Map DB shape to frontend expectations:
+    // - expose "name" derived from "company"
+    // - expose a simple "status" field (frontend currently only uses clients.length)
+    const clients = result.rows.map((c) => ({
+      ...c,
+      name: c.company,
+      status: c.status || 'active'
+    }));
+
+    res.json({ clients });
   } catch (error) {
     console.error('Get clients error:', error);
     res.status(500).json({ error: 'Internal server error' });
