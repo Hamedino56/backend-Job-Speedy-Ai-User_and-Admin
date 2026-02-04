@@ -1379,20 +1379,38 @@ app.get('/api/applications', verifyAdmin, async (req, res) => {
     const params = [];
     let paramCount = 0;
 
+    // Build count query (same filters, no pagination)
+    let countQuery = `
+      SELECT COUNT(*) as count
+      FROM applications a
+      WHERE 1=1
+    `;
+    const countParams = [];
+    let countParamCount = 0;
+
     if (status) {
       paramCount++;
+      countParamCount++;
       query += ` AND a.status = $${paramCount}`;
+      countQuery += ` AND a.status = $${countParamCount}`;
       params.push(status);
+      countParams.push(status);
     }
     if (user_id) {
       paramCount++;
+      countParamCount++;
       query += ` AND a.user_id = $${paramCount}`;
+      countQuery += ` AND a.user_id = $${countParamCount}`;
       params.push(user_id);
+      countParams.push(user_id);
     }
     if (job_id) {
       paramCount++;
+      countParamCount++;
       query += ` AND a.job_id = $${paramCount}`;
+      countQuery += ` AND a.job_id = $${countParamCount}`;
       params.push(job_id);
+      countParams.push(job_id);
     }
 
     query += ' ORDER BY a.created_at DESC';
@@ -1408,11 +1426,14 @@ app.get('/api/applications', verifyAdmin, async (req, res) => {
       params.push(parseInt(offset));
     }
 
-    const result = await pool.query(query, params);
+    const [result, countResult] = await Promise.all([
+      pool.query(query, params),
+      pool.query(countQuery, countParams)
+    ]);
 
     res.json({
       applications: result.rows,
-      count: result.rows.length
+      count: parseInt(countResult.rows[0].count)
     });
   } catch (error) {
     console.error('Get applications error:', error);
@@ -2408,6 +2429,146 @@ app.post('/api/tools/extract-skills', upload.single('resume'), async (req, res) 
   }
   } catch (error) {
     console.error('Extract skills error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================
+// ADMIN DASHBOARD APIs
+// ============================================
+
+// Get Dashboard Statistics (Admin Only) - Unified endpoint for all KPIs
+app.get('/api/admin/dashboard', verifyAdmin, async (req, res) => {
+  try {
+    const { period } = req.query; // Optional: 'week', 'month', 'year', or null for all time
+
+    // Calculate date filter based on period
+    let dateFilter = '';
+    let dateParams = [];
+    if (period === 'week') {
+      dateFilter = ' AND created_at >= NOW() - INTERVAL \'7 days\'';
+    } else if (period === 'month') {
+      dateFilter = ' AND created_at >= NOW() - INTERVAL \'30 days\'';
+    } else if (period === 'year') {
+      dateFilter = ' AND created_at >= NOW() - INTERVAL \'365 days\'';
+    }
+
+    // Get all statistics in parallel for better performance
+    const [
+      usersCount,
+      jobsCount,
+      clientsCount,
+      applicationsCount,
+      applicationsByStatus,
+      applicationsTrend,
+      jobsByStatus
+    ] = await Promise.all([
+      // Total Candidates (Users)
+      pool.query('SELECT COUNT(*) as count FROM users'),
+      
+      // Total Jobs
+      pool.query('SELECT COUNT(*) as count FROM jobs'),
+      
+      // Active Clients
+      pool.query('SELECT COUNT(*) as count FROM clients'),
+      
+      // Total Applications
+      pool.query(`SELECT COUNT(*) as count FROM applications WHERE 1=1 ${dateFilter}`, dateParams),
+      
+      // Applications by Status (for distribution chart)
+      pool.query(`
+        SELECT 
+          status,
+          COUNT(*) as count
+        FROM applications
+        GROUP BY status
+        ORDER BY count DESC
+      `),
+      
+      // Applications Trend (last 7 days for chart)
+      pool.query(`
+        SELECT 
+          DATE(created_at) as date,
+          COUNT(*) as count
+        FROM applications
+        WHERE created_at >= NOW() - INTERVAL '7 days'
+        GROUP BY DATE(created_at)
+        ORDER BY date ASC
+      `),
+      
+      // Jobs by Status
+      pool.query(`
+        SELECT 
+          status,
+          COUNT(*) as count
+        FROM jobs
+        GROUP BY status
+        ORDER BY count DESC
+      `)
+    ]);
+
+    // Format applications trend data for frontend chart
+    const trendData = applicationsTrend.rows.map(row => ({
+      date: row.date,
+      count: parseInt(row.count)
+    }));
+
+    // Format distribution data
+    const distribution = {
+      candidates: parseInt(usersCount.rows[0].count),
+      jobs: parseInt(jobsCount.rows[0].count),
+      clients: parseInt(clientsCount.rows[0].count),
+      applications: parseInt(applicationsCount.rows[0].count)
+    };
+
+    res.json({
+      stats: {
+        totalCandidates: parseInt(usersCount.rows[0].count),
+        totalJobs: parseInt(jobsCount.rows[0].count),
+        activeClients: parseInt(clientsCount.rows[0].count),
+        totalApplications: parseInt(applicationsCount.rows[0].count)
+      },
+      applicationsByStatus: applicationsByStatus.rows.map(row => ({
+        status: row.status,
+        count: parseInt(row.count)
+      })),
+      jobsByStatus: jobsByStatus.rows.map(row => ({
+        status: row.status,
+        count: parseInt(row.count)
+      })),
+      applicationsTrend: trendData,
+      distribution: distribution,
+      period: period || 'all'
+    });
+  } catch (error) {
+    console.error('Get dashboard stats error:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// Get Dashboard Statistics (Alternative endpoint - simpler version)
+app.get('/api/admin/stats', verifyAdmin, async (req, res) => {
+  try {
+    const [
+      usersCount,
+      jobsCount,
+      clientsCount,
+      applicationsCount
+    ] = await Promise.all([
+      pool.query('SELECT COUNT(*) as count FROM users'),
+      pool.query('SELECT COUNT(*) as count FROM jobs'),
+      pool.query('SELECT COUNT(*) as count FROM clients'),
+      pool.query('SELECT COUNT(*) as count FROM applications')
+    ]);
+
+    res.json({
+      totalCandidates: parseInt(usersCount.rows[0].count),
+      totalJobs: parseInt(jobsCount.rows[0].count),
+      activeClients: parseInt(clientsCount.rows[0].count),
+      totalApplications: parseInt(applicationsCount.rows[0].count)
+    });
+  } catch (error) {
+    console.error('Get stats error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
