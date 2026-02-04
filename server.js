@@ -1364,11 +1364,24 @@ app.get('/api/applications', verifyAdmin, async (req, res) => {
   try {
     const { status, user_id, job_id, limit, offset } = req.query;
 
+    // Explicitly select columns to avoid BYTEA serialization issues
+    // Exclude resume_data (BYTEA) as it's binary and causes JSON issues
     let query = `
       SELECT 
-        a.*,
+        a.id,
+        a.user_id,
+        a.job_id,
+        a.resume_url,
+        a.resume_filename,
+        a.resume_mime,
+        a.cover_letter,
+        a.status,
+        a.ai_parsed_data,
+        a.admin_notes,
+        a.created_at,
+        a.updated_at,
         u.full_name,
-        u.email,
+        u.email as user_email,
         j.title as job_title,
         j.department
       FROM applications a
@@ -1431,13 +1444,41 @@ app.get('/api/applications', verifyAdmin, async (req, res) => {
       pool.query(countQuery, countParams)
     ]);
 
+    // Parse JSONB fields if they exist
+    const applications = result.rows.map(row => {
+      const app = { ...row };
+      // Parse ai_parsed_data if it's a string
+      if (app.ai_parsed_data && typeof app.ai_parsed_data === 'string') {
+        try {
+          app.ai_parsed_data = JSON.parse(app.ai_parsed_data);
+        } catch (e) {
+          // Keep as string if parsing fails
+        }
+      }
+      return app;
+    });
+
     res.json({
-      applications: result.rows,
-      count: parseInt(countResult.rows[0].count)
+      applications: applications,
+      count: parseInt(countResult.rows[0]?.count || 0)
     });
   } catch (error) {
     console.error('Get applications error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Error details:', {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      hint: error.hint
+    });
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message,
+      details: process.env.NODE_ENV === 'development' ? {
+        code: error.code,
+        detail: error.detail,
+        hint: error.hint
+      } : undefined
+    });
   }
 });
 
@@ -1656,11 +1697,11 @@ app.get('/api/clients', verifyAdmin, async (req, res) => {
 
     // Map DB shape to frontend expectations:
     // - expose "name" derived from "company"
-    // - expose a simple "status" field (frontend currently only uses clients.length)
+    // - expose a simple "status" field (clients table doesn't have status, so default to 'active')
     const clients = result.rows.map((c) => ({
       ...c,
       name: c.company,
-      status: c.status || 'active'
+      status: 'active' // Clients table doesn't have status column, default to 'active'
     }));
 
     res.json({ clients });
@@ -2454,58 +2495,66 @@ app.get('/api/admin/dashboard', verifyAdmin, async (req, res) => {
     }
 
     // Get all statistics in parallel for better performance
-    const [
-      usersCount,
-      jobsCount,
-      clientsCount,
-      applicationsCount,
-      applicationsByStatus,
-      applicationsTrend,
-      jobsByStatus
-    ] = await Promise.all([
-      // Total Candidates (Users)
-      pool.query('SELECT COUNT(*) as count FROM users'),
-      
-      // Total Jobs
-      pool.query('SELECT COUNT(*) as count FROM jobs'),
-      
-      // Active Clients
-      pool.query('SELECT COUNT(*) as count FROM clients'),
-      
-      // Total Applications
-      pool.query(`SELECT COUNT(*) as count FROM applications WHERE 1=1 ${dateFilter}`, dateParams),
-      
-      // Applications by Status (for distribution chart)
-      pool.query(`
-        SELECT 
-          status,
-          COUNT(*) as count
-        FROM applications
-        GROUP BY status
-        ORDER BY count DESC
-      `),
-      
-      // Applications Trend (last 7 days for chart)
-      pool.query(`
-        SELECT 
-          created_at::date as date,
-          COUNT(*) as count
-        FROM applications
-        WHERE created_at >= NOW() - INTERVAL '7 days'
-        GROUP BY created_at::date
-        ORDER BY date ASC
-      `),
-      
-      // Jobs by Status
-      pool.query(`
-        SELECT 
-          status,
-          COUNT(*) as count
-        FROM jobs
-        GROUP BY status
-        ORDER BY count DESC
-      `)
-    ]);
+    // Using individual try-catch for each query to identify which one fails
+    let usersCount, jobsCount, clientsCount, applicationsCount, applicationsByStatus, applicationsTrend, jobsByStatus;
+    
+    try {
+      [
+        usersCount,
+        jobsCount,
+        clientsCount,
+        applicationsCount,
+        applicationsByStatus,
+        applicationsTrend,
+        jobsByStatus
+      ] = await Promise.all([
+        // Total Candidates (Users)
+        pool.query('SELECT COUNT(*) as count FROM users'),
+        
+        // Total Jobs
+        pool.query('SELECT COUNT(*) as count FROM jobs'),
+        
+        // Active Clients
+        pool.query('SELECT COUNT(*) as count FROM clients'),
+        
+        // Total Applications
+        pool.query(`SELECT COUNT(*) as count FROM applications WHERE 1=1 ${dateFilter}`, dateParams),
+        
+        // Applications by Status (for distribution chart)
+        pool.query(`
+          SELECT 
+            status,
+            COUNT(*) as count
+          FROM applications
+          GROUP BY status
+          ORDER BY count DESC
+        `),
+        
+        // Applications Trend (last 7 days for chart)
+        pool.query(`
+          SELECT 
+            created_at::date as date,
+            COUNT(*) as count
+          FROM applications
+          WHERE created_at >= NOW() - INTERVAL '7 days'
+          GROUP BY created_at::date
+          ORDER BY date ASC
+        `),
+        
+        // Jobs by Status
+        pool.query(`
+          SELECT 
+            status,
+            COUNT(*) as count
+          FROM jobs
+          GROUP BY status
+          ORDER BY count DESC
+        `)
+      ]);
+    } catch (queryError) {
+      console.error('Dashboard query error:', queryError);
+      throw new Error(`Database query failed: ${queryError.message}. Table/column: ${queryError.detail || 'unknown'}`);
+    }
 
     // Format applications trend data for frontend chart
     // Handle both date object and string formats
