@@ -1366,6 +1366,7 @@ app.get('/api/applications', verifyAdmin, async (req, res) => {
 
     // Explicitly select columns to avoid BYTEA serialization issues
     // Exclude resume_data (BYTEA) as it's binary and causes JSON issues
+    // Simplified: removed j.department as it may not exist in all databases
     let query = `
       SELECT 
         a.id,
@@ -1382,8 +1383,7 @@ app.get('/api/applications', verifyAdmin, async (req, res) => {
         a.updated_at,
         u.full_name,
         u.email as user_email,
-        j.title as job_title,
-        j.department
+        j.title as job_title
       FROM applications a
       LEFT JOIN users u ON a.user_id = u.id
       LEFT JOIN jobs j ON a.job_id = j.id
@@ -2495,18 +2495,16 @@ app.get('/api/admin/dashboard', verifyAdmin, async (req, res) => {
     }
 
     // Get all statistics in parallel for better performance
-    // Using individual try-catch for each query to identify which one fails
+    // Simplified queries - only get what we need for KPIs
     let usersCount, jobsCount, clientsCount, applicationsCount, applicationsByStatus, applicationsTrend, jobsByStatus;
     
     try {
+      // Core KPI queries (these must work)
       [
         usersCount,
         jobsCount,
         clientsCount,
-        applicationsCount,
-        applicationsByStatus,
-        applicationsTrend,
-        jobsByStatus
+        applicationsCount
       ] = await Promise.all([
         // Total Candidates (Users)
         pool.query('SELECT COUNT(*) as count FROM users'),
@@ -2518,20 +2516,26 @@ app.get('/api/admin/dashboard', verifyAdmin, async (req, res) => {
         pool.query('SELECT COUNT(*) as count FROM clients'),
         
         // Total Applications
-        pool.query(`SELECT COUNT(*) as count FROM applications WHERE 1=1 ${dateFilter}`, dateParams),
-        
-        // Applications by Status (for distribution chart)
-        pool.query(`
+        pool.query(`SELECT COUNT(*) as count FROM applications WHERE 1=1 ${dateFilter}`, dateParams)
+      ]);
+
+      // Optional queries (for charts) - handle errors gracefully
+      try {
+        applicationsByStatus = await pool.query(`
           SELECT 
-            status,
+            COALESCE(status, 'Unknown') as status,
             COUNT(*) as count
           FROM applications
-          GROUP BY status
+          GROUP BY COALESCE(status, 'Unknown')
           ORDER BY count DESC
-        `),
-        
-        // Applications Trend (last 7 days for chart)
-        pool.query(`
+        `);
+      } catch (e) {
+        console.warn('Applications by status query failed (status column may not exist):', e.message);
+        applicationsByStatus = { rows: [] };
+      }
+
+      try {
+        applicationsTrend = await pool.query(`
           SELECT 
             created_at::date as date,
             COUNT(*) as count
@@ -2539,18 +2543,25 @@ app.get('/api/admin/dashboard', verifyAdmin, async (req, res) => {
           WHERE created_at >= NOW() - INTERVAL '7 days'
           GROUP BY created_at::date
           ORDER BY date ASC
-        `),
-        
-        // Jobs by Status
-        pool.query(`
+        `);
+      } catch (e) {
+        console.warn('Applications trend query failed:', e.message);
+        applicationsTrend = { rows: [] };
+      }
+
+      try {
+        jobsByStatus = await pool.query(`
           SELECT 
-            status,
+            COALESCE(status, 'Unknown') as status,
             COUNT(*) as count
           FROM jobs
-          GROUP BY status
+          GROUP BY COALESCE(status, 'Unknown')
           ORDER BY count DESC
-        `)
-      ]);
+        `);
+      } catch (e) {
+        console.warn('Jobs by status query failed (status column may not exist):', e.message);
+        jobsByStatus = { rows: [] };
+      }
     } catch (queryError) {
       console.error('Dashboard query error:', queryError);
       throw new Error(`Database query failed: ${queryError.message}. Table/column: ${queryError.detail || 'unknown'}`);
