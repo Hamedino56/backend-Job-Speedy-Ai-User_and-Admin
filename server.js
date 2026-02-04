@@ -2488,11 +2488,11 @@ app.get('/api/admin/dashboard', verifyAdmin, async (req, res) => {
       // Applications Trend (last 7 days for chart)
       pool.query(`
         SELECT 
-          DATE(created_at) as date,
+          created_at::date as date,
           COUNT(*) as count
         FROM applications
         WHERE created_at >= NOW() - INTERVAL '7 days'
-        GROUP BY DATE(created_at)
+        GROUP BY created_at::date
         ORDER BY date ASC
       `),
       
@@ -2508,10 +2508,19 @@ app.get('/api/admin/dashboard', verifyAdmin, async (req, res) => {
     ]);
 
     // Format applications trend data for frontend chart
-    const trendData = applicationsTrend.rows.map(row => ({
-      date: row.date,
-      count: parseInt(row.count)
-    }));
+    // Handle both date object and string formats
+    const trendData = applicationsTrend.rows.map(row => {
+      let dateStr = row.date;
+      if (row.date instanceof Date) {
+        dateStr = row.date.toISOString().split('T')[0];
+      } else if (typeof row.date === 'string') {
+        dateStr = row.date.split('T')[0];
+      }
+      return {
+        date: dateStr,
+        count: parseInt(row.count) || 0
+      };
+    });
 
     // Format distribution data
     const distribution = {
@@ -2523,18 +2532,18 @@ app.get('/api/admin/dashboard', verifyAdmin, async (req, res) => {
 
     res.json({
       stats: {
-        totalCandidates: parseInt(usersCount.rows[0].count),
-        totalJobs: parseInt(jobsCount.rows[0].count),
-        activeClients: parseInt(clientsCount.rows[0].count),
-        totalApplications: parseInt(applicationsCount.rows[0].count)
+        totalCandidates: parseInt(usersCount.rows[0]?.count || 0),
+        totalJobs: parseInt(jobsCount.rows[0]?.count || 0),
+        activeClients: parseInt(clientsCount.rows[0]?.count || 0),
+        totalApplications: parseInt(applicationsCount.rows[0]?.count || 0)
       },
       applicationsByStatus: applicationsByStatus.rows.map(row => ({
-        status: row.status,
-        count: parseInt(row.count)
+        status: row.status || 'Unknown',
+        count: parseInt(row.count || 0)
       })),
       jobsByStatus: jobsByStatus.rows.map(row => ({
-        status: row.status,
-        count: parseInt(row.count)
+        status: row.status || 'Unknown',
+        count: parseInt(row.count || 0)
       })),
       applicationsTrend: trendData,
       distribution: distribution,
@@ -2542,7 +2551,11 @@ app.get('/api/admin/dashboard', verifyAdmin, async (req, res) => {
     });
   } catch (error) {
     console.error('Get dashboard stats error:', error);
-    res.status(500).json({ error: 'Internal server error', message: error.message });
+    res.status(500).json({ 
+      error: 'Internal server error', 
+      message: error.message,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
